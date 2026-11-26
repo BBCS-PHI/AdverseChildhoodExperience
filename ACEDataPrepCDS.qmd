@@ -1,0 +1,2101 @@
+---
+title: "ACE Data Preparation"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: false
+  warning: false
+  error: false
+  include: true
+self-contained: true
+---
+
+# Adverse Childhood Experience
+
+This quarto applies the ACEs in EHR code list <https://acesinehrs.com/> to NHS commissioning data sets Data sets in support of statutory duties - NHS England Digital <https://digital.nhs.uk//services/data-services-for-commissioners/datasets-in-support-of-statutory-duties>
+
+```{r, libraries}
+
+library(tidyverse) #tidyverse
+library(DBI)        #database connection library
+library(gtable)
+
+```
+
+```{r DB connect}
+con <- dbConnect(odbc::odbc(), .connection_string = "Driver={SQL Server};
+                 server=xxxx;
+                 database=xxxx", timeout = 10)
+
+```
+
+## Code lists
+
+The following direct translate into NHS commissioning data sets
+
+-   Diagnosis list for inpatients ICD10
+
+-   Procedure code list for inpatients OPCS4
+
+-   OP code list is for treatment specialty
+
+-   AE codelist is a historical code set not used in ECDS
+
+    #### Additional Searches
+
+-   Mental Health Minimum Dataset for any patient in MPI table
+
+-   IAPT for any patient in MPI table
+
+-   Alcohol dependency services
+
+-   999 for assaults and MH
+
+-   111 for MH
+
+-   Deaths for assault/suicide
+
+-   prescribing in primary care for antipsychotics and antidepressants
+
+```{r codelists}
+
+codelistMaster <- read.csv('codelistMaster.csv')
+
+
+cutoffs <- codelistMaster %>%
+  filter(!is.na(cut_off), 
+         !str_detect(system,'medcode'), 
+         !str_detect(system,'prodcode'),
+         str_length(cut_off) > 1) %>%
+         #system in %in% c(OPCS-4, ICD-10)) %>%
+  select(domain,code, system,indicator_specific, cut_off)
+
+codelistICD <- codelistMaster %>%
+  filter(system == 'ICD-10') 
+
+codelistICD3Str <- codelistICD %>%
+   filter(str_length(code) == 3)
+ 
+codelistICD4Str <- codelistICD %>%
+   filter(str_length(code) == 4)
+
+codelistICD4StrIPV <- codelistICD4Str %>%
+   filter(domain == 'IPV')
+
+codelistSnomed<- codelistMaster %>%
+  filter(!is.na(SnomedCTConceptId))
+
+
+codelistOP_AE <- codelistMaster %>%
+  filter(system == 'HES_OP_AE') 
+
+#there are duplicate rows for op clinics 
+codelistOP <- codelistOP_AE %>%
+  filter(substring(code,1,2) =='op') %>%
+  mutate(coding_term = str_remove(coding_term, " Service.*$"),
+        code = str_remove(code, "^opt_"),
+        code = str_remove(code, "^opm_")
+        ) %>%
+  group_by(code_original, coding_term,	ACE_indicator_code,	indicator_specific,	indicator_1,	indicator_2,	domain,	severity,	cut_off, system) %>%
+  summarise(n = n()) %>%
+  select(-n) 
+
+
+codelistHESAPC <- codelistMaster %>%
+  filter(system == 'HESAPC_DISDEST_OR_ADMISORC')
+
+codelistOPCS4 <- codelistMaster %>%
+  filter(system == 'OPCS-4') %>%
+  mutate(code = str_remove(code, "^p_"))
+
+write.csv(codelistMaster,'codelistMaster.csv')
+         
+
+```
+
+## MPI
+
+Master patient index using the Unique Property Reference Number (pseudonyised) spine extract
+
+```{r}
+
+
+
+MPIDataQry <- "SELECT   PatientId
+      ,[encrypt_clear_uprn] as UPRN
+      ,[Gender]
+      ,[Birth_Month]
+      ,Death_Month
+      ,[der_Age]
+      ,[GP_Practice_Code]
+      ,[der_SICB_Code_Of_Registration]
+      ,[der_SICB_Code_Of_Residence]
+      ,[CareHomeFlag]
+      ,[der_CareHomeFlagMatchStrength]
+      ,[CareHome_LongTermTemporaryPatient]
+      ,[care_home_service_type]
+      ,[ri_flag]
+      ,[CareHome_ODS_Code]
+      ,[CareHome_LocationID]
+      ,[CareHome_Is_Active]
+      ,[CareHome_Specialises_in_Over65]
+      ,[DE_Flag]
+      ,[LSOA_2021]
+      ,[LSOA_2011]
+      ,[total_household_population]
+      ,[living_alone_flag]
+      ,[living_with_under_18_flag]
+      ,[living_with_over_64_flag]
+      ,[OS_ClassificationCode]
+      ,[OS_ClassificationDescription]
+      ,[HMRC_Property_Taxed_As_Holiday_Accommodation_Flag]
+      ,[OS_BuildStatus]
+      ,[OS_Private_Outdoor_Space_Flag]
+      ,[OS_Rural_Urban_Classification]
+      ,[OS_Rural_Urban_Code]
+      ,[CACI_Household_Acorn_Type]
+      ,[CACI_Household_Acorn_Type_Description]
+      ,[CACI_Postcode_Acorn_Type]
+      ,[CACI_Postcode_Wellbeing_Type]
+      ,[Number_of_EPC_Certificates]
+      ,[EPC_Current_Energy_Rating]
+      ,[EPC_Property]
+      ,[EPC_BuiltForm]
+      ,[EPC_Tenure]
+      ,[Address_Matching_Source]
+      ,[ABP_or_PAF]
+      ,[address_matching_score]
+      ,[field_status]
+      ,[match_step]
+      ,[postcode_change_type]
+      ,[Potential_Homeless_Flag]
+      ,[Potential_Student_Flag]
+      ,[modified_date]
+        
+  FROM [database].[schema].[mpi_caci_all_in_one]"
+
+MPISrc <- dbGetQuery(con, MPIDataQry)
+
+MPISrc <- MPISrc %>% 
+    mutate(
+    latest_flag = if_else(
+      modified_date == max(modified_date, na.rm = TRUE),
+      1, 0
+    ))
+
+```
+
+## Inpatient admissions
+
+### Criteria
+
+Data source: SUS
+
+Diagnosis: codelist has both 4 char and 3 char codes, which is a bit contradictory as not all 4 char codes are listed specifically under a 3 char, so if you match 3 char might over match!
+
+```{r IPDiagnostic}
+
+#### 4str codes
+
+DBI::dbWriteTable(
+  con,
+  name = "#codelistICD4Str",
+  value = codelistICD4Str,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+
+sus4StrDataQry <- "SELECT  
+        'InpatientAdmission' as event,
+        nhsnumber as PatientId,
+        ProviderSpellIdentifier,
+        [AdmissionType],
+        [AdmissionDate] as event_start,
+        [DiagnosisCode],
+        DiagnosisDescription,
+        concat( [AdmissionType], ': ',DiagnosisDescription) as event_detail,
+        AgeOnAdmission as Age,
+        GenderCode,
+        dis.[DischargeDestinationCode],
+        case 
+          when dis.[DischargeMethodCode] = 4 then 'Died'
+          else 'Alive' end as outcome,
+        dis.[DischargeDate]  as event_end ,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        cut_off,
+        system
+    FROM [database].[SUS].[VwInpatientEpisodes] e
+
+    INNER JOIN (
+        SELECT EpisodeId, DiagnosisOrder, DiagnosisCode, DiagnosisDescription, 	coding_term,	ACE_indicator_code,	indicator_specific,	indicator_1,	indicator_2,	domain,	severity,	cut_off, system
+        FROM [database].[SUS].[VwInpatientEpisodesDiagnosisRelational]
+        inner join (select * from #codelistICD4Str) c
+           on LEFT(DiagnosisCode, 4) = c.code
+    ) d 
+    ON d.episodeid = e.episodeid
+
+    left JOIN (
+        SELECT PbrSpellIdentifier, DischargeDestinationCode,
+               DischargeMethodCode, DischargeDate
+        FROM [database].[SUS].[VwInpatientEpisodes]
+        WHERE IsLastInSpell = 1
+    ) dis 
+        ON e.PbrSpellIdentifier = dis.PbrSpellIdentifier
+        
+    left join (SELECT  [AdmissionMethodCode]
+      ,[AdmissionMethodDescription]
+      ,[AdmissionType]
+  FROM [Reference].[dbo].[DIM_tbAdmissionMethod]) adm on adm.AdmissionMethodCode = 
+e.AdmissionMethodCode"
+
+
+sus4StrSrc <- dbGetQuery(con, sus4StrDataQry)
+
+
+### cutoffs 
+
+sus4StrSrc <- sus4StrSrc  %>%
+  filter(!((DiagnosisCode == 'R457' | DiagnosisCode == 'R457') & Age > 18))
+
+## Z33X only where linked to assault - exclude where no assault
+
+Z33xExcNotAssaults <- 
+"SELECT ProviderSpellIdentifier
+from [database].[SUS].[VwInpatientEpisodes] spell
+inner join 
+(select
+  diag.EpisodeID,
+  diag.DiagnosisOrder,
+  diag.DiagnosisCode,
+  diag.DiagnosisDescription,
+  [ChapterDescription], 
+  [SubChapterDescription] 
+  FROM [database].[SUS].[VwInpatientEpisodesDiagnosisRelational] diag
+  INNER JOIN (
+    SELECT DISTINCT EpisodeID
+    FROM [database].[SUS].[VwInpatientEpisodesDiagnosisRelational]
+    WHERE DiagnosisCode = 'Z33X'
+  ) z
+  ON diag.EpisodeID = z.EpisodeID
+  left join (select [DiagnosisCode],[ChapterDescription], [SubChapterDescription]  FROM [Reference].[dbo].[DIM_tbDiagnosis]) diag_desc
+  on diag.DiagnosisCode = diag_desc.[DiagnosisCode]
+  WHERE diag.DiagnosisCode <> 'Z33X' and 
+  [SubChapterDescription] not like 'Assault') z33x
+ON spell.EpisodeID = z33x.EpisodeID
+group by ProviderSpellIdentifier"
+
+Z33xExcNotAssaults <- dbGetQuery(con, Z33xExcNotAssaults)
+
+
+sus4StrSrcz33 <- sus4StrSrc %>%
+  filter(!domain == 'IPV', !ProviderSpellIdentifier %in% Z33xExcNotAssaults$ProviderSpellIdentifier)
+
+
+  
+```
+
+```{r, 3 str codes}
+
+##### 3 str codes
+
+DBI::dbWriteTable(
+  con,
+  name = "#codelistICD3Str",
+  value = codelistICD3Str,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+sus3StrDataQry <- "SELECT  
+        'InpatientAdmission' as event,
+        nhsnumber as PatientId,
+        ProviderSpellIdentifier,
+        [AdmissionType],
+        [AdmissionDate] as event_start,
+        [DiagnosisCode],
+        DiagnosisDescription,
+        concat( [AdmissionType], ': ',DiagnosisDescription) as event_detail,
+        AgeOnAdmission as Age,
+        GenderCode,
+        dis.[DischargeDestinationCode],
+        case 
+          when dis.[DischargeMethodCode] = 4 then 'Died'
+          else 'Alive' end as outcome,
+        dis.[DischargeDate]  as event_end ,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        cut_off,
+        system
+    FROM [database].[SUS].[VwInpatientEpisodes] e
+
+    INNER JOIN (
+        SELECT EpisodeId, DiagnosisOrder, DiagnosisCode, DiagnosisDescription, 	coding_term,	ACE_indicator_code,	indicator_specific,	indicator_1,	indicator_2,	domain,	severity,	cut_off, system
+        FROM [database].[SUS].[VwInpatientEpisodesDiagnosisRelational]
+        inner join (select * from #codelistICD3Str) c
+           on LEFT(DiagnosisCode, 3) = c.code
+    ) d 
+    ON d.episodeid = e.episodeid
+
+    left JOIN (
+        SELECT PbrSpellIdentifier, DischargeDestinationCode,
+               DischargeMethodCode, DischargeDate
+        FROM [database].[SUS].[VwInpatientEpisodes]
+        WHERE IsLastInSpell = 1
+    ) dis 
+        ON e.PbrSpellIdentifier = dis.PbrSpellIdentifier
+        
+    left join (SELECT  [AdmissionMethodCode]
+      ,[AdmissionMethodDescription]
+      ,[AdmissionType]
+  FROM [Reference].[dbo].[DIM_tbAdmissionMethod]) adm on adm.AdmissionMethodCode = 
+e.AdmissionMethodCode"
+
+sus3StrSrc <- dbGetQuery(con, sus3StrDataQry)
+
+### cutoffs 
+
+sus3StrSrc <- sus3StrSrc %>%
+  filter(!(DiagnosisCode == 'R45' & Age > 18)) 
+
+
+## Exclude Z33 not assualts
+sus3StrSrc <- sus3StrSrc  %>%
+  filter(!domain == 'IPV', !ProviderSpellIdentifier %in% Z33xExcNotAssaults$ProviderSpellIdentifier)
+
+susSrc <- sus3StrSrc %>%
+  union(sus4StrSrc)
+
+susSrc <- susSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+         event_start = as.Date(event_start),
+               GenderCode = as.integer(GenderCode))
+
+susSrcPeople <- susSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+
+
+```
+
+## Inpatient admissions by DISDEST_OR_ADMISORC
+
+### Criteria
+
+data source: SUS
+
+```{r IPadmSrcDisDest}
+
+
+DBI::dbWriteTable(
+  con,
+  name = "#codelistHESAPC",
+  value = codelistHESAPC,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+susAPCDataQry <- "SELECT  
+        'InpatientAdmission' as event,
+        nhsnumber as PatientId,
+        e.[AdmissionMethodCode],
+        [AdmissionSourceDescription],
+        [AdmissionDate] as event_start,
+        concat(AdmissionMethodDescription, ' admission from: ', AdmissionSourceDescription) as event_detail,
+        AgeOnAdmission as Age,
+        GenderCode,
+        dis.[DischargeDestinationCode],
+        case 
+          when dis.[DischargeMethodCode] = 4 then 'Died'
+          else 'Alive' end as outcome,
+        dis.[DischargeDate]as event_end,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        cut_off,
+        system
+    FROM [database].[SUS].[VwInpatientEpisodes] e
+
+    left JOIN (
+        SELECT PbrSpellIdentifier, DischargeDestinationCode,
+               DischargeMethodCode, DischargeDate
+        FROM [database].[SUS].[VwInpatientEpisodes]
+        WHERE IsLastInSpell = 1
+    ) dis 
+    ON e.PbrSpellIdentifier = dis.PbrSpellIdentifier
+    
+    INNER JOIN (select code, coding_term,	ACE_indicator_code,	indicator_specific,	indicator_1,	indicator_2,	domain,	severity,	cut_off, system
+                from #codelistHESAPC) c
+        on AdmissionSourceCode = c.code 
+             OR dis.DischargeDestinationCode = c.code
+             
+    Left join (SELECT [AdmissionSourceCode]
+                     ,[AdmissionSourceDescription]
+              FROM [Reference].[dbo].[DIM_tbAdmissionSource]) adm
+    on e.AdmissionSourceCode = adm.AdmissionSourceCode
+  
+    left join (SELECT  [AdmissionMethodCode]
+                      ,[AdmissionMethodDescription]
+                      ,[AdmissionType]
+              FROM [Reference].[dbo].[DIM_tbAdmissionMethod]) admm on admm.AdmissionMethodCode = e.AdmissionMethodCode"
+
+susAPCSrc <- dbGetQuery(con, susAPCDataQry)
+
+
+susAPCSrc <- susAPCSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+         event_start = as.Date(event_start),
+               GenderCode = as.integer(GenderCode))
+
+```
+
+## Inpatient admissions by Procedure
+
+### Criteria
+
+data source: SUS
+
+```{r IPProcedure}
+
+
+DBI::dbWriteTable(
+  con,
+  name = "#codelistOPCS4",
+  value = codelistOPCS4,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+susOPCS4DataQry <- "SELECT  
+        'InpatientProcedure' as event,
+        nhsnumber as PatientId,
+        e.[AdmissionMethodCode],
+        [AdmissionDate] as event_start,
+       [ProcedureOrder],
+       d.[ProcedureCode],
+       [ProcedureName],
+       [ProcedureDate],
+       concat([AdmissionMethodDescription], ': ',[ProcedureDescription]) as event_detail,
+        AgeOnAdmission as Age,
+        GenderCode,
+        dis.[DischargeDestinationCode],
+        case 
+          when dis.[DischargeMethodCode] = 4 then 'Died'
+          else 'Alive' end as outcome,
+        dis.[DischargeDate] as  event_end,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        cut_off,
+        [system]
+    FROM [database].[SUS].[VwInpatientEpisodes] e
+
+    INNER JOIN (
+        SELECT  [EpisodeId]
+			  ,[ProcedureOrder]
+			  ,[ProcedureCode]
+			  ,[ProcedureName]
+			  ,[ProcedureDate]
+			  , coding_term
+			  ,	ACE_indicator_code
+			  ,	indicator_specific
+			  ,	indicator_1
+			  ,	indicator_2
+			  ,	domain
+			  ,	severity
+			  ,	cut_off
+			  , [system]
+		FROM [database].[SUS].[VwInpatientEpisodesProceduresRelational]
+		inner join  #codelistOPCS4 c  on ProcedureCode = c.code_original ) d
+   ON d.episodeid = e.episodeid
+
+    left JOIN (
+        SELECT PbrSpellIdentifier, DischargeDestinationCode,
+               DischargeMethodCode, DischargeDate
+        FROM [database].[SUS].[VwInpatientEpisodes]
+        WHERE IsLastInSpell = 1
+    ) dis 
+    ON e.PbrSpellIdentifier = dis.PbrSpellIdentifier
+    
+    left join (SELECT  [AdmissionMethodCode]
+      ,[AdmissionMethodDescription]
+      ,[AdmissionType]
+  FROM [Reference].[dbo].[DIM_tbAdmissionMethod]) admm on admm.AdmissionMethodCode = 
+e.AdmissionMethodCode
+
+    left join (SELECT 
+       [ProcedureCode]
+      ,[ProcedureDescription]
+      ,[IsSensitive]
+  FROM [Reference].[dbo].[DIM_tbProcedure]) opcs4 on opcs4.ProcedureCode = d.ProcedureCode"
+
+susOPCS4Src <- dbGetQuery(con, susOPCS4DataQry)
+
+
+susOPCS4Src <- susOPCS4Src %>%
+  mutate(PatientId = as.integer(PatientId),
+         event_start = as.Date(event_start),
+               GenderCode = as.integer(GenderCode))
+
+susOPCS4SrcPeople <- susOPCS4Src  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+```
+
+## Outpatient attendances by specialty
+
+### Criteria
+
+data source: OP
+
+```{r OP}
+
+
+DBI::dbWriteTable(
+  con,
+  name = "#codelistOP",
+  value = codelistOP,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+susOPDataQry <- "SELECT  
+        'Outpatient' as event,
+        'Outpatient' as event_detail,
+        nhsnumber as PatientId,
+        [AppointmentDate] as event_start,
+        [AppointmentDate] as event_end,
+        'Alive' as outcome,
+        Age,
+        TreatmentSpecialtyCode as code,
+        GenderCode,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        cut_off,
+        system
+      FROM [database].[SUS].[VwOutpatientSUS] e
+
+    INNER JOIN (
+    SELECT  
+        coding_term
+      ,	ACE_indicator_code
+      ,	indicator_specific
+      ,	indicator_1
+      ,	indicator_2
+      ,	domain
+      ,	severity
+      ,	cut_off
+      ,code_original
+      ,system
+    from #codelistOP) c
+    on [TreatmentSpecialtyCode] = c.code_original
+    
+"
+
+susOPSrc <- dbGetQuery(con, susOPDataQry)
+
+
+susOPSrc <- susOPSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+         event_start = as.Date(event_start),
+               GenderCode = as.integer(GenderCode))
+
+susOPSrcPeople <- susOPSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+susOPSrc  %>%
+  group_by(code) %>%
+  summarise(n=n())
+
+```
+
+## Mental Health Services
+
+All patients known to MH services as taken from the MHSDS MPI table
+
+Additional data for mental health status those who are LAC, or have a Educational Assessment, LDA or Legal Section
+
+```{r}
+
+
+MHSDSDataQry <- "
+SELECT distinct
+    'Known to MH services' AS event,
+    p.PatientId,
+    d.PrimDiag,
+    d.DiagnosisDate,
+    r.ReferralRequestReceivedDate,
+    r.ServDischDate,
+    r.ServiceTypeName,
+    r.PrimReasonReferralMH_Desc,
+    COALESCE(d.[SubChapterDescription], r.PrimReasonReferralMH_Desc) AS reason
+FROM [database].[MentalHealth].[V6MHSDS_001mpi_DeDuplicated] p
+
+OUTER APPLY (
+    SELECT TOP (1)
+        PrimDiag
+		,[DiagnosisDescription]
+		,[ChapterCode]
+		,[ChapterDescription]
+		,[SubChapterCode]
+		,[SubChapterDescription]
+        ,COALESCE(RecordStartDate, EFFECTIVE_FROM) AS DiagnosisDate
+    FROM [database].[MentalHealth].[V6MHSDS_604primdiag_DeDuplicated] d
+	left join (SELECT [DiagnosisCode]
+					,[DiagnosisDescription]
+					,[ChapterCode]
+					,[ChapterDescription]
+					,[SubChapterCode]
+					,[SubChapterDescription]
+					FROM [Reference].[dbo].[DIM_tbDiagnosis]) icd
+	on icd.DiagnosisCode = PrimDiag
+    WHERE d.Person_ID = p.Person_ID
+      AND d.PrimDiag IS NOT NULL
+    ORDER BY COALESCE(RecordStartDate, EFFECTIVE_FROM) DESC
+) d
+
+LEFT JOIN (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY Person_ID
+               ORDER BY ReferralRequestReceivedDate DESC
+           ) AS rnref
+    FROM [database].[MHSDS].[101_Referral]
+    WHERE ServiceTypeName IS NOT NULL
+       OR ClinRespPriorityType_Desc IS NOT NULL
+       OR PrimReasonReferralMH_Desc IS NOT NULL
+) r
+    ON r.Person_ID = p.Person_ID
+   AND r.rnref = 1
+   where PatientId is not null"
+
+
+MHSDSSrc <- dbGetQuery(con, MHSDSDataQry)
+
+
+
+
+MHSDSSrc <- MHSDSSrc %>%
+  left_join(ICDDataQry, by = c('PrimDiag' = 'DiagnosisCode')) %>%
+  mutate(PatientId = as.integer(PatientId),
+        coding_term = reason,
+        ACE_indicator_code = 'MHPnn1',
+        indicator_specific = 'Mental Health other',
+        indicator_1 = 'Mental health problems NOS',
+        indicator_2 = 'Common mental health problems',
+        domain = 'MHP',
+        severity = 'symptom',
+        system = 'MHSDS',
+        cut_off = NA)
+
+MHSDSDataSrcPeople <- MHSDSSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+```
+
+### Mental Health Act (MHA) Episodes
+
+#### Mental Health Act Legal Status Classification Code
+
+<https://www.datadictionary.nhs.uk/data_elements/mental_health_act_legal_status_classification_code.html>
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 01 | Informal |
+| 02 | Formally detained under Mental Health Act Section 2 |
+| 03 | Formally detained under Mental Health Act Section 3 |
+| 04 | Formally detained under Mental Health Act Section 4 |
+| 05 | Formally detained under Mental Health Act Section 5(2) |
+| 06 | Formally detained under Mental Health Act Section 5(4) |
+| 07 | Formally detained under Mental Health Act Section 35 |
+| 08 | Formally detained under Mental Health Act Section 36 |
+| 09 | Formally detained under Mental Health Act Section 37 with section 41 restrictions |
+| 10 | Formally detained under Mental Health Act Section 37 |
+| 12 | Formally detained under Mental Health Act Section 38 |
+| 13 | Formally detained under Mental Health Act Section 44 |
+| 14 | Formally detained under Mental Health Act Section 46 |
+| 15 | Formally detained under Mental Health Act Section 47 with section 49 restrictions |
+| 16 | Formally detained under Mental Health Act Section 47 |
+| 17 | Formally detained under Mental Health Act Section 48 with section 49 restrictions |
+| 18 | Formally detained under Mental Health Act Section 48 |
+| 19 | Formally detained under Mental Health Act Section 135 |
+| 20 | Formally detained under Mental Health Act Section 136 |
+| 31 | Formally detained under Criminal Procedure(Insanity) Act 1964 as amended by the Criminal Procedures (Insanity and Unfitness to Plead) Act 1991 |
+| 32 | Formally detained under other acts |
+| 33 | Supervised Discharge (Mental Health (Patients in the Community) Act 1995) (Retired 03 November 2008 - but may apply to some patients until 3 May 2009) |
+| 34 | Formally detained under Mental Health Act Section 45A (Retired 01 September 2014) |
+| 35 | Subject to guardianship under Mental Health Act Section 7 |
+| 36 | Subject to guardianship under Mental Health Act Section 37 |
+| 37 | Formally detained under Mental Health Act Section 45A (Limited direction in force) |
+| 38 | Formally detained under Mental Health Act Section 45A (Limitation direction ended) |
+
+#### Mental Health Act 2007 Mental Category
+
+Mental Health Act Legal Status Classification Assignment Period
+
+To carry details of Mental Health Act Legal Status Classification Assignment Periods for the patient. One occurrence of this group is permitted for each assigned Mental Health Responsible Clinician to the Mental Health Act Legal Status Classification Assignment Period.
+
+<https://www.datadictionary.nhs.uk/data_elements/mental_health_act_2007_mental_category.html>
+
+The primary reason for the detention of PATIENTS under the Mental Health Act 1983, as amended by the Mental Health Act 2007.
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| A | Mental disorder ( [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") not present or not primary reason for using Act) |
+| B | Mental disorder ( [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") primary reason for using Act) |
+
+```{r}
+### Legal status}
+
+MHSDSDataLegalQry <- "SELECT 
+Person_Id
+,[StartDateMHActLegalStatusClass]
+,[EndDateMHActLegalStatusClass]
+,[ExpiryDateMHActLegalStatusClass]
+,[InactTimeMHAPeriod]
+,[LegalStatusClassPeriodEndReason]
+,[LegalStatusClassPeriodStartReason]
+,[LegalStatusCode]
+,[LegalStatusClassPeriodStartReason_Desc]
+,[LegalStatusClassPeriodEndReason_Desc]
+,[MentalCat_Desc]
+,[HealthCare_Provider]
+,[StartDateTimeMHActLegalStatusClass]
+,[NHSDLegalStatusCode_Desc]
+,[NHSDLegalStatus_ShortDesc]
+,ReportingPeriodStartDate
+,EFFECTIVE_FROM
+, ROW_NUMBER() OVER (
+  PARTITION BY Person_Id
+  ORDER BY EFFECTIVE_FROM DESC
+) AS latestStatus
+FROM [database].[MHSDS].[401_MH_Act_Legal_Status_Period] "
+
+MHSDSDataLegalSrc<- dbGetQuery(con, MHSDSDataLegalQry)
+
+MHSDSDataLegalSrc <- MHSDSDataLegalSrc %>%
+  left_join(MHSDSSrc %>% select(PatientId, Person_Id, Gender)) %>%
+  mutate(event = 'MH Legal Status',
+         PatientId = as.integer(PatientId),
+         GenderCode = as.integer(Gender),
+         coding_term = 'Legal Status',
+         ACE_indicator_code = 'MHPnn2',
+         indicator_specific = 'Mental Health other',
+         indicator_1 = 'Mental health problems NOS',
+         indicator_2 = 'Common mental health problems',
+         domain = 'MHP',
+         severity = 'symptom',
+         system = 'MHSDS',
+         cut_off = NA)
+```
+
+### **MH Patient Indicators**
+
+To carry details of specific indicators relating to a patient. One occurrence of this group is permitted containing the current or most recently recorded status or indicators and psychosis information
+
+#### Looked After Child Indicator
+
+<https://www.datadictionary.nhs.uk/data_elements/looked_after_child_indicator.html>
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| Y | Yes - is a [**Looked After Child**](https://www.datadictionary.nhs.uk/nhs_business_definitions/looked_after_child.html "A Looked After Child (also referred to as a Child Looked After) is a child in the care of a Local Authority.") |
+| N | No - is not a [**Looked After Child**](https://www.datadictionary.nhs.uk/nhs_business_definitions/looked_after_child.html "A Looked After Child (also referred to as a Child Looked After) is a child in the care of a Local Authority.") |
+
+#### Looked After Child Legal Status
+
+<https://www.datadictionary.nhs.uk/data_elements/looked_after_child_legal_status.html>
+
+| Code |          Description           |
+|:----:|:------------------------------:|
+|  01  | Section 20 Voluntary Agreement |
+|  02  |     Section 31 Care Order      |
+|  03  | Section 38 Interim Care Order  |
+|  08  |       Other (not listed)       |
+
+#### Educational Assessment Outcome
+
+The outcome of an EDUCATIONAL ASSESSMENT.
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 01 | No [**Special Education Needs**](https://www.datadictionary.nhs.uk/supporting_information/special_education_needs.html "Special Education Needs refers to children who have Learning Difficulties or disabilities that make it harder for them to learn or access EDUCATION than most children of the same age.") |
+| 02 | School Action (Retired 01 September 2015) |
+| 03 | School Action Plus and Statutory Assessment (Retired 01 September 2015) |
+| 04 | Statemented (Retired 01 September 2015) |
+| 05 | Subject to [**Education, Health and Care Plan**](https://www.datadictionary.nhs.uk/nhs_business_definitions/education_health_and_care_plan.html "An Education, Health and Care Plan (EHC) is the document which replaces Statements of Need and Learning Difficulties Assessments for Children or Young People with Special Educational Needs.") ( [**EHC**](https://www.datadictionary.nhs.uk/nhs_business_definitions/education_health_and_care_plan.html "An Education, Health and Care Plan (EHC) is the document which replaces Statements of Need and Learning Difficulties Assessments for Children or Young People with Special Educational Needs.")) |
+
+### Child Protection Plan Indication Code
+
+An indication of whether the child or young person (PATIENT) is, or has previously been, subject to a Child Protection Plan.
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 1 | Has never been subject to a [**Child Protection Plan**](https://www.datadictionary.nhs.uk/nhs_business_definitions/child_protection_plan.html "A Child Protection Plan is initiated when a child is judged to be at risk of significant harm.") |
+| 2 | Has previously been subject to a [**Child Protection Plan**](https://www.datadictionary.nhs.uk/nhs_business_definitions/child_protection_plan.html "A Child Protection Plan is initiated when a child is judged to be at risk of significant harm.") |
+| 3 | Is currently subject to a [**Child Protection Plan**](https://www.datadictionary.nhs.uk/nhs_business_definitions/child_protection_plan.html "A Child Protection Plan is initiated when a child is judged to be at risk of significant harm.") |
+
+### Patient Diagnosis Status (Autism)
+
+The status of the PATIENT DIAGNOSIS of Autism , as required for Transforming Care.
+
+<https://www.datadictionary.nhs.uk/data_elements/patient_diagnosis_status_autism.html>
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 1 | Confirmed [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") |
+| 2 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") and the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a  [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") |
+| 3 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") but the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is not on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a  [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") |
+| 4 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") but it is not known whether the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a  [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") |
+| 5 | No [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of  [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") |
+| U | [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") asked but [**Autism**](https://www.datadictionary.nhs.uk/nhs_business_definitions/autism.html "Autism is defined as a lifelong condition that affects how a PERSON communicates with, and relates to, other people.") status not known |
+| Z | Not Stated ( [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") asked but declined to provide a response) |
+
+### Patient Diagnosis Status (Learning Disability)
+
+The status of the PATIENT DIAGNOSIS of a Learning Disability , as required for Transforming Care.
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 1 | Confirmed [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") |
+| 2 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") and the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a  [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") |
+| 3 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") but the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is not on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") |
+| 4 | Suspected [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") but it is not known whether the [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") is on a diagnostic  [**PATIENT PATHWAY**](https://www.datadictionary.nhs.uk/classes/patient_pathway.html "The specific route that a particular PATIENT takes from the first REFERRAL REQUEST RECEIVED DATE of a SERVICE REQUEST or the ACTIVITY DATE of the first emergency ACTIVITY where there is no related SERVICE REQUEST.") for a [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") |
+| 5 | No [**PATIENT DIAGNOSIS**](https://www.datadictionary.nhs.uk/classes/patient_diagnosis.html "Diagnostic observations recorded about a PATIENT.") of a [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") |
+| U | [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") asked but  [**Learning Disability**](https://www.datadictionary.nhs.uk/nhs_business_definitions/learning_disability.html "A Learning Disability may have a significant impact on a PERSON 's life.") status not known |
+| Z | Not Stated ( [**PATIENT**](https://www.datadictionary.nhs.uk/classes/patient.html "A PERSON with a specific disease or condition who receives treatment from a Health Care Provider or any REGISTRABLE BIRTH.") asked but declined to provide a response) |
+
+```{r}
+### Looked after status
+
+MHSDSDataPersonalQry <- "SELECT [EFFECTIVE_FROM]
+,[LACLegalStatus]
+,[LACStatus]
+,autismstatus
+,[CPP]
+,[CPP_Desc]
+,LDStatus
+,LDStatus_Desc
+,EducationalAssessOutcome
+,EducationalAssessOutcome_Desc
+,[LocalPatientID]
+,Person_Id
+,[ReportingPeriodEndDate]
+,[ReportingPeriodStartDate]
+,[LACStatus_Desc]
+,[LACLegalStatus_Desc]
+, ROW_NUMBER() OVER (
+  PARTITION BY Person_Id
+  ORDER BY EFFECTIVE_FROM DESC
+) AS latestLAC
+FROM [database].[MHSDS].[005_Patient_Indicators]
+where [LACLegalStatus] like '0[1238]' 
+      or [LACStatus] like 'Y'
+      or autismstatus   like '[1234]'
+      or LDStatus    like '[1234]'
+      or EducationalAssessOutcome  like '05'
+      or CPP like '[23]' "
+
+MHSDSDataPersonalSrc<- dbGetQuery(con, MHSDSDataPersonalQry)
+
+MHSDSDataPersonalSrc <- MHSDSDataPersonalSrc %>%
+  left_join(MHSDSSrc %>% select(PatientId, Person_Id, Gender))
+
+MHSDSDataLACSrc <- MHSDSDataPersonalSrc %>% 
+  filter(!LACLegalStatus_Desc == 'No - is not a looked after child', !is.na(LACLegalStatus_Desc)) %>%
+  mutate(event = 'MH Looked After child',
+         PatientId = as.integer(PatientId),
+         GenderCode = as.integer(Gender),
+         coding_term = 'LAC',
+         ACE_indicator_code = 'MHPnn3',
+         indicator_specific = 'Mental Health other',
+         indicator_1 = 'Mental health problems NOS',
+         indicator_2 = 'Common mental health problems',
+         domain = 'MHP',
+         severity = 'symptom',
+         system = 'MHSDS',
+         cut_off = NA)
+
+
+MHSDSDataEducSrc <- MHSDSDataPersonalSrc %>% 
+  filter(!EducationalAssessOutcome_Desc == 'Subject to Education, Health and Care Plan (EHC)', !is.na(EducationalAssessOutcome_Desc)) %>%
+  mutate(event = 'MH Educational Assessment',
+         PatientId = as.integer(PatientId),
+         GenderCode = as.integer(Gender),
+         coding_term = 'Education, Health and Care Plan (EHC)',
+         ACE_indicator_code = 'MHPnn4',
+         indicator_specific = 'Mental Health other',
+         indicator_1 = 'Mental health problems NOS',
+         indicator_2 = 'Common mental health problems',
+         domain = 'MHP',
+         severity = 'symptom',
+         system = 'MHSDS',
+         cut_off = NA)
+
+
+
+MHSDSDataEducSrcPeople <- MHSDSDataEducSrc  %>%
+  summarise(n=n(), .by = PatientId)
+
+
+MHSDSDataLDASrc <- MHSDSDataPersonalSrc %>% 
+  filter((autismstatus >0 & autismstatus < 5) | (LDStatus >0 & LDStatus <5) ) %>%
+  mutate(event = 'MH LDA Status',
+         PatientId = as.integer(PatientId),
+         GenderCode = as.integer(Gender),
+         coding_term = 'Learning Disability or Autism',
+         ACE_indicator_code = 'MHPnn5',
+         indicator_specific = 'Mental Health other',
+         indicator_1 = 'Mental health problems NOS',
+         indicator_2 = 'Common mental health problems',
+         domain = 'MHP',
+         severity = 'symptom',
+         system = 'MHSDS',
+         cut_off = NA)
+
+MHSDSDataLDASrcPeople <- MHSDSDataLDASrc  %>%
+  summarise(n=n(), .by = PatientId)
+
+
+MHSDSDataCPPSrc <- MHSDSDataPersonalSrc %>% 
+  filter(CPP == 2 | CPP == 3 ) %>%
+  mutate(event = 'MH Child Protection Plan',
+         PatientId = as.integer(PatientId),
+         GenderCode = as.integer(Gender),
+         coding_term = 'CPP',
+         ACE_indicator_code = 'MHPnn6',
+         indicator_specific = 'Mental Health other',
+         indicator_1 = 'Mental health problems NOS',
+         indicator_2 = 'Common mental health problems',
+         domain = 'MHP',
+         severity = 'symptom',
+         system = 'MHSDS',
+         cut_off = NA)
+
+
+MHSDSDataLDASrcPeople <- MHSDSDataLDASrc  %>%
+  summarise(n=n(), .by = PatientId)
+
+MHSDSDataPersonalFull <- rbind(MHSDSDataLACSrc,
+                               MHSDSDataEducSrc,
+                               MHSDSDataLDASrc,
+                               MHSDSDataCPPSrc
+                               )
+```
+
+## IAPT - Talking Therapies
+
+Patients known to IAPT services as taken from the MPI table
+
+```{r}
+#### add care contact start and end and reasons
+
+IAPTDataQry <- "SELECT 
+      'Talking therapies' as event
+      ,'Talking therapies' as event_detail
+      ,[PseudoNhsNumber]
+      ,[PatientAge]
+      ,[Gender]
+      ,[RecordStartDate] as event_start
+      ,[RecordStartDate] as event_end
+      ,'Alive' as outcome
+  FROM [database].[IAPT].[vw_IAPT_MDS_v21_De-duplicated_tb_001_MPI]"
+
+
+IAPTSrc <- dbGetQuery(con, IAPTDataQry)
+
+
+IAPTSrc <- IAPTSrc %>%
+  mutate(PatientId = as.integer(PseudoNhsNumber),
+               AppointmentDate = as.Date(RecordStartDate),
+               GenderCode = as.integer(Gender),
+        coding_term = 'Contacted Talking Therapies Services',
+        ACE_indicator_code = 'MHPnn2',
+        indicator_specific = 'Mental Health other',
+        indicator_1 = 'Mental health problems NOS',
+        indicator_2 = 'Common mental health problems',
+        domain = 'MHP',
+        severity = 'symptom',
+        system = 'IAPT',
+        cut_off = NA)
+
+IAPTDataSrcPeople <- IAPTSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+```
+
+## 999
+
+This is a local flow and may not be available to all ICBs. There is a national Ambulance data set but it is not mature/complete enough to provide the details required.
+
+```{r}
+
+Nine99DataQry <- "SELECT  
+'999' as event
+      ,CAD.NHS_Number, 
+CAD.Incident_Number, 
+CC.Conveyance_Number,
+Patient_Age,
+Patient_Sex,
+Date_of_Incident ,
+WMAS_Chief_Complaint_Desc_Mapped
+FROM [database].[ECDS].[VwWMASComputerAidedDispatch] as CAD 
+left join [database].[ECDS].[VwWMASConveyance_V2] as CC on CAD.Incident_Number = CC.Incident_Number
+
+Where CAD.WMAS_Chief_Complaint_Desc_Mapped like '%assault%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%stabbing%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%suicide%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%mental%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%alcohol%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%firearms%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%overdose%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%hanging%'or
+CAD.WMAS_Chief_Complaint_Desc_Mapped like '%section 136%'"
+
+
+Nine99Src <- dbGetQuery(con, Nine99DataQry)
+
+
+Nine99Src <- Nine99Src %>%
+  mutate(Date_of_Incident= as.Date(Date_of_Incident),
+          PatientId = as.integer(NHS_Number),
+               GenderCode = as.integer(Patient_Sex),
+        coding_term = WMAS_Chief_Complaint_Desc_Mapped,
+        ACE_indicator_code = '999',
+         indicator_specific =  case_when(
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Suicide') ~  'Suicide attempt',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Hanging') ~  'Suicide attempt',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Overdose') ~  'Drug misuse',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Alcohol') ~  'Alcohol misuse',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Mental')|
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Section 136') ~  'Mental health problem NOS',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Firearms') |
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Stabbing')   ~  'Assault NOS, IPV',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Assault') ~  'Sexual abuse, IPV',
+              .default = 'tbc'),
+        
+        indicator_1 =  case_when(
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Suicide')  ~ 'Self-harm or suicide attempts',
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Hanging')  ~ 'Self-harm or suicide attempts',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Overdose') ~  'Drug misuse, severe (likely dependence levels)',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Alcohol') ~  'Alcohol misuse, severe (incl. self-report measures/units per week)',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Mental')|
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Section 136') ~  'Mental health problem NOS',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Firearms') |
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Stabbing')   ~  'Suspected IPV NOS',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Assault') ~  'Suspected IPV NOS',
+               .default = 'tbc'),
+        
+        indicator_2 =  case_when(
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Suicide')  ~ 'Common mental health problems',
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Hanging')  ~ 'Common mental health problems',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Overdose') ~  'Substance misuse',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Alcohol') ~  'Alcohol misuse',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Mental')|
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Section 136') ~  'Common mental health problems',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Firearms') |
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Stabbing')   ~  'Suspected IPV (susp. IPV)',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Assault') ~  'Sexual abuse, IPV',
+               .default = 'tbc'),
+        
+        domain =  case_when(
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Suicide')  ~ 'MHP',
+             str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Hanging')  ~ 'MHP',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Overdose') ~  'SM',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Alcohol') ~  'SM',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Mental')|
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Section 136') ~  'MHP',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Firearms') |
+                str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Stabbing')   ~  'IPV',
+              str_detect(WMAS_Chief_Complaint_Desc_Mapped,'Assault') ~  'IPV',
+               .default = 'tbc'),
+        severity = 'symptom',
+        cut_off = NA,
+        system = '999')
+
+Nine99DataSrcPeople <- Nine99Src  %>%
+  group_by(PatientId) %>%
+  summarise(n = n())
+
+
+Nine99Src %>% ggplot() +geom_bar(aes(x = WMAS_Chief_Complaint_Desc_Mapped))
+Nine99Src %>% ggplot() +geom_bar(aes(x = indicator_specific))
+Nine99Src %>% ggplot() +geom_bar(aes(x = indicator_1))
+Nine99Src %>% ggplot() +geom_bar(aes(x = indicator_2))
+Nine99Src %>% ggplot() +geom_bar(aes(x = domain))
+
+
+```
+
+## Alcohol dependence services
+
+```{r}
+
+AlcoholDataQry <- "SELECT 
+'Alcohol treatment' as event
+      ,[GENDER]
+      ,[FIRSTCONTACT_DATE]
+      ,[PatientAge]
+      ,[PatientId]
+  FROM [database].[National].[National_Alcohol_Dependence_Data]"
+
+
+AlcoholSrc <- dbGetQuery(con, AlcoholDataQry)
+
+
+AlcoholSrc <- AlcoholSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+        GenderCode = as.integer(GENDER),
+        coding_term = 'Alcohol Dependency Treatement',
+        ACE_indicator_code = 'MHPnn3',
+        indicator_specific = 'Alcohol misuse',
+        indicator_1 = 'Alcohol misuse, severe (incl. self-report measures/units per week)',
+        indicator_2 = 'Alcohol misuse',
+        domain = 'SM',
+        severity = 'symptom',
+        cut_off = NA,
+        system = 'Alcohol Dependency',)
+
+AlcoholDataSrcPeople <- AlcoholSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+
+```
+
+## Deaths
+
+From suicides and deliberate injuries X85–Y09 Assault (intentional harm by others) X60–X84 intentional self-harm Y10–Y34 events of undetermined intent (if unclear whether assault)
+
+```{r}
+
+DeathDataQry <- "SELECT 
+
+'Death' as event
+      ,[DEC_AGEC]
+      ,[DEC_AGECUNIT]
+      ,DEC_SEX
+	  ,REG_DATE
+      ,[S_INJURY_EXTERNAL]
+      ,d.S_UNDERLYING_COD_ICD10      
+      ,[S_UNDERLYING_DESCRIPTION_ICD10]
+
+      ,[PatientId]
+  FROM [database].[Other].[VwDeathsRegister] d
+  inner join( SELECT 
+      [DEATHS_ID]
+      ,[S_UNDERLYING_COD_ICD10]
+      ,[S_COD_CODE_1]
+      ,[S_COD_CODE_2]
+      ,[S_COD_CODE_3]
+      ,[S_COD_CODE_4]
+      ,[S_COD_CODE_5]
+      ,[S_COD_CODE_6]
+      ,[S_COD_CODE_7]
+      ,[S_COD_CODE_8]
+      ,[S_COD_CODE_9]
+      ,[S_COD_CODE_10]
+      ,[S_COD_CODE_11]
+      ,[S_COD_CODE_12]
+      ,[S_COD_CODE_13]
+      ,[S_COD_CODE_14]
+      ,[S_COD_CODE_15]
+      ,[S_UNDERLYING_DESCRIPTION_ICD10]
+      ,[S_COD_DESCRIPTION_1]
+      ,[S_COD_DESCRIPTION_2]
+      ,[S_COD_DESCRIPTION_3]
+      ,[S_COD_DESCRIPTION_4]
+      ,[S_COD_DESCRIPTION_5]
+      ,[S_COD_DESCRIPTION_6]
+      ,[S_COD_DESCRIPTION_7]
+      ,[S_COD_DESCRIPTION_8]
+      ,[S_COD_DESCRIPTION_9]
+      ,[S_COD_DESCRIPTION_10]
+      ,[S_COD_DESCRIPTION_11]
+      ,[S_COD_DESCRIPTION_12]
+      ,[S_COD_DESCRIPTION_13]
+      ,[S_COD_DESCRIPTION_14]
+      ,[S_COD_DESCRIPTION_15]
+  FROM [database].[Other].[VwDeaths_ICD10]
+  where ([S_UNDERLYING_COD_ICD10]  like 'X[6789]%' or 
+        [S_UNDERLYING_COD_ICD10]  like 'Y[012]%' or 
+        [S_UNDERLYING_COD_ICD10]  like 'Y3[01234]%')) i
+  on i.DEATHS_ID = d.deaths_id
+  "
+
+DeathSrc <- dbGetQuery(con, DeathDataQry)
+
+DeathSrc <- DeathSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+               RegistrationDeath = as.Date(REG_DATE),
+               GenderCode = as.integer(DEC_SEX),
+        coding_term = S_UNDERLYING_DESCRIPTION_ICD10,
+         ACE_indicator_code =  case_when(
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[67]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[8][01234]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y[12]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y3[01234]')  ~  'MHPnn2',
+              str_detect(S_UNDERLYING_COD_ICD10,'^X8[56789]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X9')   |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y0')  ~    'IPVnn1',
+              .default = 'tbc'),
+        
+         indicator_specific =  case_when(
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[67]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[8][01234]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y[12]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y3[01234]')  ~  'Suicide attempt',
+              str_detect(S_UNDERLYING_COD_ICD10,'^X8[56789]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X9')   |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y0')  ~    'Assault NOS, IPV',
+              .default = 'tbc'),
+        
+        indicator_1 =  case_when(
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[67]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[8][01234]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y[12]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y3[01234]')  ~ 'Self-harm or suicide attempts',
+              str_detect(S_UNDERLYING_COD_ICD10,'^X8[56789]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X9')   |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y0')  ~     'Suspected IPV NOS', 
+               .default = 'tbc'),
+        
+        indicator_2 =  case_when(
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[67]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[8][01234]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y[12]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y3[01234]')    ~ 'Common mental health problems',
+              str_detect(S_UNDERLYING_COD_ICD10,'^X8[56789]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X9')   |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y0')  ~     'Suspected IPV (susp. IPV)',
+               .default = 'tbc'),
+        
+        domain =  case_when(
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[67]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X[8][01234]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y[12]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y3[01234]')    ~ 'MHP',
+              str_detect(S_UNDERLYING_COD_ICD10,'^X8[56789]') |
+              str_detect(S_UNDERLYING_COD_ICD10,'^X9')   |
+              str_detect(S_UNDERLYING_COD_ICD10,'^Y0')  ~     'IVP',
+               .default = 'tbc'),
+        severity = 'symptom',
+        cut_off = NA,
+        system = 'Deaths')
+
+DeathDataSrcPeople <- DeathSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+
+```
+
+## ED attendances
+
+Codes used to identify ACE events
+
+| InjuryIntentSNOMEDCode |      InjuryIntentECDSDescription       |
+|:----------------------:|:--------------------------------------:|
+|    1082491000000103    |  Apparent assault (single assailant)   |
+|    1082501000000109    | Apparent assault (multiple assailants) |
+|       219256006        |    Injury due to legal intervention    |
+|       276853009        |         Self inflicted injury          |
+
+| ChiefComplaintCode | ChiefComplaintDescription1 | ChiefComplaintDescription2 | ChiefComplaintGroup |
+|:---------------:|:-----------------:|:-----------------:|:---------------:|
+| 2073000 | Delusions | Delusion (finding) | Psychosocial / Behaviour change |
+| 6471006 | Feeling suicidal | Suicidal thoughts (finding) | Psychosocial / Behaviour change |
+| 18653004 | Alcohol intoxication | Alcohol intoxication | Drug and Alcohol |
+| 24199005 | Behaviour : agitation | Feeling agitated (finding) | Psychosocial / Behaviour change |
+| 35489007 | Depression | Depressive disorder (disorder) | Psychosocial / Behaviour change |
+| 48694002 | Feeling anxious | Anxiety (finding) | Psychosocial / Behaviour change |
+| 56890008 | States victim of sexual assault | Victim of sexual aggression (finding) Genitourinary | Genitourinary |
+| 66214007 | Effects of alcohol and/or drug use | Substance abuse (disorder) Drug and Alcohol | Drug and Alcohol |
+| 191480000 | Alcohol withdrawal syndrome | Alcohol withdrawal syndrome (disorder) | Drug and Alcohol |
+| 248004009 | Behaviour : violent | Physical aggression (finding) | Psychosocial / Behaviour change |
+| 248020004 | Behaviour : unusual | Bizarre behavior (finding) | Psychosocial / Behaviour change |
+| 248062006 | Self-harm | Self-injurious behavior (finding) | Psychosocial / Behaviour change |
+| 267073005 | Suicidal | Suicidal Suicidal (finding) | Psychosocial / Behaviour change |
+| 272022009 | Complaining of feeling depressed | Complaining of feeling depressed (finding) | Psychosocial / Behaviour change |
+| 366979004 | Depressive feelings | Depressed mood (finding) | Psychosocial / Behaviour change |
+| 1254795002 | Drug withdrawal | Substance withdrawal syndrome (disorder) | Drug and Alcohol |
+
+```{r}
+
+
+EDDataQry <- "SELECT 
+'ED attendance' as event
+      ,
+       GenderCode
+      ,arrivaldate
+      ,[ChiefComplaintCode]
+      ,ChiefComplaintDescription
+	    ,InjuryIntentCode
+	    ,InjuryIntentDescription
+      ,[PseudoNHSNumber] as PatientId
+    FROM [database].[ECDSV2].[VwECDSAll]
+  where  (ChiefComplaintCode in ('1254795002',
+'18653004',
+'191480000',
+'2073000',
+'24199005',
+'248004009',
+'248020004',
+'248062006',
+'267073005',
+'272022009',
+'35489007',
+'366979004',
+'48694002',
+'56890008',
+'6471006',
+'66214007')
+or ChiefComplaintDescription like '%assault%'
+or InjuryIntentCode in ('1082491000000103','1082501000000109','219256006','276853009')
+  or InjuryIntentDescription in  ('%assault%', 'Injury due to legal intervention','Self inflicted injury'))"
+
+
+EDSrc <- dbGetQuery(con, EDDataQry)
+
+EDSrc <- EDSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+               ArrivalDate = as.Date(arrivaldate),
+               GenderCode = as.integer(GenderCode),
+        coding_term =  case_when(
+              InjuryIntentDescription ==  'Self inflicted injury' ~ InjuryIntentDescription,
+              str_detect(InjuryIntentDescription,'Apparent assault') ~ InjuryIntentDescription,
+              InjuryIntentDescription ==  'Injury due to legal intervention' ~ InjuryIntentDescription,
+              InjuryIntentCode ==  '1082491000000103' ~ InjuryIntentDescription,
+              InjuryIntentCode ==  '1082501000000109' ~ InjuryIntentDescription,
+              InjuryIntentCode ==  '219256006' ~ InjuryIntentDescription,
+              InjuryIntentCode ==  '276853009' ~ InjuryIntentDescription,
+              ChiefComplaintCode ==  '1254795002' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '18653004' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '191480000' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '2073000' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '24199005' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '248004009' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '248020004' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '248062006' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '267073005' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '272022009' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '35489007' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '366979004' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '48694002' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '56890008' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '6471006' ~  ChiefComplaintDescription,
+              ChiefComplaintCode ==  '66214007' ~  ChiefComplaintDescription,
+              .default = ChiefComplaintDescription),
+        
+        ACE_indicator_code = 'ED',
+        
+        indicator_specific =   case_when(
+              InjuryIntentDescription ==  'Self inflicted injury' ~ 'Suicide attempt',
+              str_detect(InjuryIntentDescription,'Apparent assault') ~ 'Assault NOS, IPV',
+              InjuryIntentDescription ==  'Injury due to legal intervention' ~ 'Assault NOS, IPV',
+              InjuryIntentCode ==  '1082491000000103' ~ 'Assault NOS, IPV',
+              InjuryIntentCode ==  '1082501000000109' ~ 'Assault NOS, IPV',
+              InjuryIntentCode ==  '219256006' ~ 'Assault NOS, IPV',
+              InjuryIntentCode ==  '276853009' ~ 'Suicide attempt',
+              ChiefComplaintCode ==  '1254795002' ~  'Drug misuse',
+              ChiefComplaintCode ==  '18653004' ~  'Alcohol misuse',
+              ChiefComplaintCode ==  '191480000' ~  'Alcohol misuse',
+              ChiefComplaintCode ==  '2073000' ~  'Mental Health other',
+              ChiefComplaintCode ==  '24199005' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248004009' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248020004' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248062006' ~  'Suicide attempt',
+              ChiefComplaintCode ==  '267073005' ~  'Suicide attempt',
+              ChiefComplaintCode ==  '272022009' ~  'Mental Health other',
+              ChiefComplaintCode ==  '35489007' ~  'Mental Health other',
+              ChiefComplaintCode ==  '366979004' ~  'Mental Health other',
+              ChiefComplaintCode ==  '48694002' ~  'Mental Health other',
+              ChiefComplaintCode ==  '56890008' ~  'Sexual abuse, IPV',
+              ChiefComplaintCode ==  '6471006' ~  'Suicide attempt',
+              ChiefComplaintCode ==  '66214007' ~  'Alcohol misuse',
+              .default = 'tbc'),
+        
+        indicator_1 =  case_when(
+              InjuryIntentDescription ==  'Self inflicted injury' ~ 'Self-harm or suicide attempt',
+              str_detect(InjuryIntentDescription,'Apparent assault') ~ 'IPV, NOS (incl. physical/sexual abuse)',
+              InjuryIntentDescription ==  'Injury due to legal intervention' ~ 'IPV, NOS (incl. physical/sexual abuse)',
+              InjuryIntentCode ==  '1082491000000103' ~ 'IPV, NOS (incl. physical/sexual abuse)',
+              InjuryIntentCode ==  '1082501000000109' ~ 'IPV, NOS (incl. physical/sexual abuse)',
+              InjuryIntentCode ==  '219256006' ~ 'IPV, NOS (incl. physical/sexual abuse)',
+              InjuryIntentCode ==  '276853009' ~ 'Self-harm or suicide attempt',
+              ChiefComplaintCode ==  '1254795002' ~  'Drug misuse, severe (likely dependence levels)',
+              ChiefComplaintCode ==  '18653004' ~  'Alcohol misuse, severe (incl. self-report measures/units per week)',
+              ChiefComplaintCode ==  '191480000' ~  'Alcohol misuse, severe (incl. self-report measures/units per week)',
+              ChiefComplaintCode ==  '2073000' ~  'Mental Health other',
+              ChiefComplaintCode ==  '24199005' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248004009' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248020004' ~  'Mental Health other',
+              ChiefComplaintCode ==  '248062006' ~  'Self-harm or suicide attempts',
+              ChiefComplaintCode ==  '267073005' ~  'Self-harm or suicide attempts',
+              ChiefComplaintCode ==  '272022009' ~  'Mental Health other',
+              ChiefComplaintCode ==  '35489007' ~  'Mental Health other',
+              ChiefComplaintCode ==  '366979004' ~  'Mental Health other',
+              ChiefComplaintCode ==  '48694002' ~  'Mental Health other',
+              ChiefComplaintCode ==  '56890008' ~  'Suspected IPV, physical or sexual abuse',
+              ChiefComplaintCode ==  '6471006' ~  'Self-harm or suicide attempts',
+              ChiefComplaintCode ==  '66214007' ~  'Alcohol misuse, severe (incl. self-report measures/units per week)',
+               .default = 'tbc'),
+        
+        indicator_2 =  case_when(
+              InjuryIntentDescription ==  'Self inflicted injury' ~ 'Common mental health problems',
+              str_detect(InjuryIntentDescription,'Apparent assault') ~ 'IPV',
+              InjuryIntentDescription ==  'Injury due to legal intervention' ~ 'IPV',
+              InjuryIntentCode ==  '1082491000000103' ~  'IPV',
+              InjuryIntentCode ==  '1082501000000109' ~  'IPV',
+              InjuryIntentCode ==  '219256006' ~  'IPV',
+              InjuryIntentCode ==  '276853009' ~ 'Common mental health problems',
+              ChiefComplaintCode ==  '1254795002' ~  'Drug misuse',
+              ChiefComplaintCode ==  '18653004' ~  'Alcohol misuse',
+              ChiefComplaintCode ==  '191480000' ~  'Alcohol misuse',
+              ChiefComplaintCode ==  '2073000' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '24199005' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '248004009' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '248020004' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '248062006' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '267073005' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '272022009' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '35489007' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '366979004' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '48694002' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '56890008' ~  'IPV',
+              ChiefComplaintCode ==  '6471006' ~  'Common mental health problems',
+              ChiefComplaintCode ==  '66214007' ~  'Alcohol misuse',
+               .default = 'tbc'),
+        
+        domain =  case_when(
+              InjuryIntentDescription ==  'Self inflicted injury' ~ 'MHP',
+              str_detect(InjuryIntentDescription,'Apparent assault') ~ 'IPV',
+              InjuryIntentDescription ==  'Injury due to legal intervention' ~ 'IPV',
+              InjuryIntentCode ==  '1082491000000103'  ~ 'IPV',
+              InjuryIntentCode ==  '1082501000000109' ~ 'IPV',
+              InjuryIntentCode ==  '219256006'  ~ 'IPV',
+              InjuryIntentCode ==  '276853009' ~ 'MHP',
+              ChiefComplaintCode ==  '1254795002' ~  'SM',
+              ChiefComplaintCode ==  '18653004' ~  'SM',
+              ChiefComplaintCode ==  '191480000' ~  'SM',
+              ChiefComplaintCode ==  '2073000' ~  'MHP',
+              ChiefComplaintCode ==  '24199005' ~  'MHP',
+              ChiefComplaintCode ==  '248004009' ~  'MHP',
+              ChiefComplaintCode ==  '248020004' ~  'MHP',
+              ChiefComplaintCode ==  '248062006' ~  'MHP',
+              ChiefComplaintCode ==  '267073005' ~  'MHP',
+              ChiefComplaintCode ==  '272022009' ~  'MHP',
+              ChiefComplaintCode ==  '35489007' ~  'MHP',
+              ChiefComplaintCode ==  '366979004' ~  'MHP',
+              ChiefComplaintCode ==  '48694002' ~  'MHP',
+              ChiefComplaintCode ==  '56890008' ~  'IPV',
+              ChiefComplaintCode ==  '6471006' ~  'MHP',
+              ChiefComplaintCode ==  '66214007' ~  'SM',
+               .default = 'tbc'),
+        severity = 'symptom',
+        cut_off = NA,
+        system = 'ECDS')
+
+EDDataSrcPeople <- EDSrc  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+
+EDSrc %>% group_by(coding_term)%>%
+  summarise(n = n()) %>%
+  gt()
+
+```
+
+## 111
+
+This is a local flow. There were two providers hence the 2 extractions. Most ICBs would have one.
+
+| SymptomGroupCode | SymptomGroupDescription |
+|:--:|:--:|
+| WMAS Mental Health Problem | SG1203 |
+| Child Safeguard/Protection or Vulnerable Adult Concern | SG1042 |
+| Worsening known Mental health problem SG1186 |  |
+| Alcohol Intoxication | SG1009 |
+| Drug, solvent, alcohol misuse | SG1185 |
+
+|           DHU SymptomGroup            | SymptomGroupID |
+|:-------------------------------------:|:--------------:|
+|         Alcohol Intoxication          |      1009      |
+|      Drug solvent alcohol misuse      |      1185      |
+| Worsening known Mental health problem |      1186      |
+|         Mental Health Problem         |      1203      |
+|               Self-Harm               |      1228      |
+
+```{r}
+
+One11WMASDataQry <- "SELECT 
+'111 call WMAS' as event
+,YearMonth 
+	  ,[AgeAtActivityDate] as  Age
+      ,[GenderCode]
+      ,SymptomGroupCode
+      ,[SymptomGroupDescription]
+      ,[CallConnectDate]
+      ,[ClinicalAssessmentServiceOutcomeDescription]
+      ,[PatientId]
+  FROM [database].[ECDS].[VwWMAS111]
+WHERE [SymptomGroupCode] in ('SG1203','SG1042','SG1186','SG1009','SG1185')"
+
+One11WMASDataSrc <- dbGetQuery(con, One11WMASDataQry)
+
+
+One11WMASSrc <- One11WMASDataSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+          pathwaysstartdate = coalesce(as.Date(CallConnectDate), as.Date( paste0(substr(YearMonth,1,4),'-',substr(YearMonth,5,6), "-01"))) ,
+        coding_term = SymptomGroupDescription,
+        ACE_indicator_code =   case_when(
+              SymptomGroupCode ==  'SG1009' ~  'MHPOOO1',
+              SymptomGroupCode ==  'SG1185' ~  'MHPOOO2',
+              SymptomGroupCode ==  'SG1042' & Age < 19 ~  'CM1',
+              SymptomGroupCode %in% c('SG1203','SG1186')  ~  'MHPOOO3',
+              .default = 'tbc'),
+
+        indicator_specific =   case_when(
+              SymptomGroupCode ==  'SG1203' ~  'Alcohol misuse',
+              SymptomGroupCode ==  'SG1185' ~  'Drug misuse',
+              SymptomGroupCode ==  'SG1042' & Age < 19 ~  'Child protection/safeguarding',
+              SymptomGroupCode %in% c('SG1203','SG1186')   ~  'Mental health problem NOS',
+              .default = 'tbc'),
+
+        indicator_1 =  case_when(
+             SymptomGroupCode ==  'SG1009' ~ 'Alcohol misuse, severe (incl. self-report measures/units per week)',
+             SymptomGroupCode ==  'SG1185' ~ 'Drug misuse, severe (likely dependence levels)',
+              SymptomGroupCode ==  'SG1042' & Age < 19 ~  'Child protection/safeguarding',
+             SymptomGroupCode %in% c('SG1203','SG1186')  ~ 'Mental health problem NOS',
+               .default = 'tbc'),
+
+        indicator_2 =  case_when(
+             SymptomGroupCode ==  'SG1009' ~ 'Alcohol misuse',
+             SymptomGroupCode ==  'SG1185' ~ 'Substance misuse',
+              SymptomGroupCode ==  'SG1042' & Age < 19 ~  'CM',
+             SymptomGroupCode %in% c('SG1203','SG1186') ~ 'Common mental health problems',
+               .default = 'tbc'),
+
+        domain =  case_when(
+             SymptomGroupCode ==  'SG1009' ~ 'SM',
+             SymptomGroupCode ==  'SG1185' ~ 'SM',
+              SymptomGroupCode ==  'SG1042' & Age < 19 ~  'CM',
+             SymptomGroupCode %in% c('SG1203','SG1186')  ~ 'MHP',
+               .default = 'tbc'),
+        severity = 'symptom',
+        system = '111WMAS',
+        cut_off = NA) %>%
+  select(-YearMonth, -CallConnectDate )
+
+One11DataQry <- "SELECT
+'111 call' as event
+      ,patientgender as GenderCode
+       ,patientAge as  Age
+       ,pathwaysstartdate
+      ,PatientId
+      ,SymptomGroupID
+      ,SymptomGroup
+  FROM [database].[Other].[VwDHU111]
+  where SymptomGroupID in ('1185','1186','1009','1228','1203')"
+
+One11Src <- dbGetQuery(con, One11DataQry)
+
+One11Src <- One11Src %>%
+  mutate(PatientId = as.integer(PatientId),
+               pathwaysstartdate = as.Date(pathwaysstartdate),
+               GenderCode = if_else(GenderCode == 'F',2,if_else(GenderCode =='M',1,NA)),
+        coding_term = SymptomGroup,
+        ACE_indicator_code =   case_when(
+              SymptomGroupID ==  '1009' ~  'MHPOOO1',
+              SymptomGroupID ==  '1185' ~  'MHPOOO2',
+              SymptomGroupID %in% c('1186','1228','1203')  ~  'MHPOOO3',
+              .default = 'tbc'),
+        
+        indicator_specific =   case_when(
+              SymptomGroupID ==  '1009' ~  'Alcohol misuse',
+              SymptomGroupID ==  '1185' ~  'Drug misuse',
+              SymptomGroupID %in% c('1186','1228','1203')  ~  'Mental health problem NOS',
+              .default = 'tbc'),
+        
+        indicator_1 =  case_when(
+             SymptomGroup ==  '1009' ~ 'Alcohol misuse, severe (incl. self-report measures/units per week)',
+             SymptomGroupID ==  '1185' ~ 'Drug misuse, severe (likely dependence levels)',
+             SymptomGroupID %in% c('1186','1203') ~ 'Mental health problem NOS',
+             SymptomGroupID == '1228' ~ 'Self-harm or suicide attempts',
+               .default = 'tbc'),
+
+        indicator_2 =  case_when(
+             SymptomGroupID ==  '1009' ~ 'Alcohol misuse',
+             SymptomGroupID ==  '1185' ~ 'Substance misuse',
+             SymptomGroupID %in% c('1186','1228','1203') ~ 'Common mental health problems',
+               .default = 'tbc'),
+
+        domain =  case_when(
+             SymptomGroupID ==  '1009' ~ 'SM',
+             SymptomGroupID ==  '1185' ~ 'SM',
+             SymptomGroupID %in% c('1186','1228','1203') ~ 'MHP',
+               .default = 'tbc'),
+        severity = 'symptom',
+        system = '111DHU',
+        cut_off = NA)
+
+One11SrcPeople <- One11Src  %>%
+  group_by(PatientId) %>%
+  summarise(n=n())
+
+
+```
+
+## Maternity
+
+There are social factors columns in the MSDS but they may not be as helpful as they initially look.
+
+```{r}
+
+maternityDataQry <- "SELECT star.[UniqPregID]
+      ,[LabourDeliveryID]
+      ,star.[Person_ID_Baby]
+	  ,[BabyPatientId]
+      ,star.[Person_ID_Mother]
+	  ,[MotherPatientId]
+      ,[BMI105Den]
+      ,[BMI105Num]
+      ,[AgeAtBirthMother]
+      ,[BabyBirthDate]
+      ,star.[EmploymentStatusMother] as starEmploymentStatusMother
+      ,[EmploymentStatusMotherDescription]
+      ,[EthnicCategoryBaby]
+      ,[EthnicCategoryBabyDescription]
+      ,[EthnicCategoryBabyName]
+      ,[Language]
+      ,[ISOEnglishName]
+      ,[MotherBMIBookingBand]
+      ,[MotherIndicators]
+      ,star.[ComplexSocialFactorsInd]  as starComplexSocialFactorsInd
+      ,pb.[ComplexSocialFactorsInd] as pbComplexSocialFactorsInd
+	  
+      ,pb.[AntenatalAppDate]
+      ,[AlcoholUnitsBooking]
+      ,[AlcoholUnitsPerWeekBand]
+      ,pb.[DisabilityIndMother]
+      ,[EmploymentStatusPartner]
+      ,[LangCode]
+      ,pb.[MHPredictionDetectionIndMother]
+      ,[SupportStatusIndMother]
+
+      ,[SocPerDate]
+      ,[SocPerSNOMED]
+	  ,[SNOMEDDescription]
+
+  FROM [database].[MSDS].[vwStarMaternity] star
+
+  inner join (SELECT
+				 [MotherPatientId]
+				,[UniqPregID] 
+				,Person_ID_Mother
+			 FROM [database].[Maternity_MSDS].[MSD001MotherDemog]) mum
+  on mum.[UniqPregID] = star.UniqPregID and mum.Person_ID_Mother = star.Person_ID_Mother
+
+  left join ( SELECT [Person_ID_Baby]
+      ,[BabyPatientId]
+	  ,UniqPregID
+  FROM [database].[Maternity_MSDS].[MSD401BabyDemographics]) baby
+  on baby.[UniqPregID] = star.UniqPregID and baby.[Person_ID_Baby] = star.[Person_ID_Baby]
+
+  left join ( SELECT  [AgeAtBookingMother]
+      ,[AntenatalAppDate]
+      ,[AlcoholUnitsBooking]
+      ,[AlcoholUnitsPerWeekBand]
+      ,[ComplexSocialFactorsInd]
+      ,[DisabilityIndMother]
+      ,[EmploymentStatusMother]
+      ,[EmploymentStatusPartner]
+      ,[LangCode]
+      ,[LPIDMother]
+      ,[MHPredictionDetectionIndMother]
+      ,[Person_ID_Mother]
+      ,[SupportStatusIndMother]
+      ,[UniqPregID]
+  FROM [database].[Maternity_MSDS].[MSD101PregnancyBooking]) pb
+  on pb.[Person_ID_Mother] = star.Person_ID_Mother and 
+  pb.[UniqPregID] = star.[UniqPregID] 
+
+  left join ( SELECT  [msds003Id]
+	  ,[LPIDMother]
+      ,[MSD003_ID]
+      ,[Person_ID_Mother]
+      ,[RecordNumber]
+      ,[SocPerDate]
+      ,[SocPerSNOMED]
+      ,[UniqPregID]
+	  ,[SNOMEDDescription]
+  FROM [database].[Maternity_MSDS].[MSD003SocPersCircumstances]
+		left join (SELECT [SNOMEDCode]
+      ,[SNOMEDDescription]
+  FROM [Reference].[SNOMED].[DIM_tbSNOMEDDescriptions] ) sno
+  on [SocPerSNOMED] = sno.[SNOMEDCode]
+  ) soc
+  on soc.[Person_ID_Mother] = star.Person_ID_Mother and 
+    soc.[UniqPregID]= star.[UniqPregID]"
+
+
+maternitySrc <- dbGetQuery(con, maternityDataQry)
+
+
+
+```
+
+## Prescriptions
+
+Primary care prescribing for BNF chapters 040\[23\]
+
+```{r}
+
+RxDataQry <- "select  
+'Rx' as event
+      ,PatientId
+      ,[BSAPrescriptionID]
+      ,[ChargeStatus]
+      ,[ExemptionCode]
+      ,[PatientAge]
+      ,[MPSGender] as PatientGender
+      ,[BNF_Section]
+      ,[BNF_Section_Code]
+      ,[BNF_Paragraph]
+      ,[BNF_Paragraph_Code]
+      ,[BNF_Subparagraph]
+      ,[BNF_Subparagraph_Code]
+      ,[PrescribedBNFCode]
+      ,[PrescribedBNFName]
+      ,[PrescribedCountryCode]
+      ,[PrescribedFormulation]
+      ,[PrescribedMedicineStrength]
+      ,[PrescribedQuantity]
+      ,[ProcessingPeriodDate]
+ FROM [Other].[VwPCareMeds] p
+inner join (SELECT  [BNF_Chapter]
+      ,[BNF_Chapter_Code]
+      ,[BNF_Section]
+      ,[BNF_Section_Code]
+      ,[BNF_Paragraph]
+      ,[BNF_Paragraph_Code]
+      ,[BNF_Subparagraph]
+      ,[BNF_Subparagraph_Code]
+  FROM [database].[Reference].[BNF_Code_Information_SCD]
+  where Is_Latest = 1 and
+  left([BNF_Product_Code],4) like '040[23]' 
+  and [BNF_Paragraph] not like  'Tricyclic and related antidepressant dru'
+  group by  [BNF_Chapter]
+      ,[BNF_Chapter_Code]
+      ,[BNF_Section]
+      ,[BNF_Section_Code]
+      ,[BNF_Paragraph]
+      ,[BNF_Paragraph_Code]
+      ,[BNF_Subparagraph]
+      ,[BNF_Subparagraph_Code]) bnf
+  on bnf.[BNF_Paragraph_Code] = left(p.PrescribedBNFCode,6)"
+
+RxSrc <- dbGetQuery(con, RxDataQry)
+
+#RxSrc <- RxSrc[, -20]
+
+RxSrc <- RxSrc %>%
+  mutate(PatientId = as.integer(PatientId),
+        ProcessingPeriodDate = as.Date(ProcessingPeriodDate),
+        GenderCode = as.integer(PatientGender),
+        coding_term = BNF_Section,
+        ACE_indicator_code = 'MHPnn4',
+        indicator_specific =   case_when(
+              BNF_Section_Code ==  '0402' ~  'Antipsychotic medication NOS',
+              BNF_Section_Code ==  '0403' ~  'Antidepressant',
+              .default = 'tbc'),
+        
+        indicator_1 =  case_when(
+              BNF_Section_Code ==  '0402' ~  'Use of antipsychotics',
+              BNF_Section_Code ==  '0403' ~  'Depression incl. antidepressants',
+               .default = 'tbc'),
+        
+        indicator_2 =  case_when(
+              BNF_Section_Code ==  '0402' ~  'Psychosis',
+              BNF_Section_Code ==  '0403' ~  'Common mental health problems',
+               .default = 'tbc'),
+        
+        domain =  case_when(
+              BNF_Section_Code ==  '0402' ~  'MHP',
+              BNF_Section_Code ==  '0403' ~  'MHP',
+               .default = 'tbc'),
+        
+        severity = 'symptom',
+        system = 'Rx',
+        cut_off = NA) %>%
+  select(-PatientGender )
+
+
+RxDataSummary <- RxSrc %>%
+  group_by(PatientId
+      ,indicator_2
+      ,indicator_1
+      ,indicator_specific
+      ) %>%
+  summarise( items = n(),
+             firstRx = min(ProcessingPeriodDate),
+             lastRx =max(ProcessingPeriodDate))
+
+
+```
+
+## CSDS
+
+### Safeguarding Vulnerability Factors Indicator
+
+"The term " Safeguarding Children " is defined as "the process of protecting children from abuse or neglect, preventing impairment of their health and development, and ensuring they are growing up in circumstances consistent with the provision of safe and effective care that enables children to have optimum life chances and enter adulthood successfully".") vulnerability factors present
+
+<https://www.datadictionary.nhs.uk/nhs_business_definitions/safeguarding_children.html>
+
+| Code | Description |
+|:----:|:-----------:|
+|  Y   |     Yes     |
+|  N   |     No      |
+
+<https://www.datadictionary.nhs.uk/data_elements/safeguarding_vulnerability_factors_indicator.html>
+
+### Looked After Child Indicator
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| Y | Yes - is a [**Looked After Child**](https://www.datadictionary.nhs.uk/nhs_business_definitions/looked_after_child.html "A Looked After Child (also referred to as a Child Looked After) is a child in the care of a Local Authority.") |
+| N | No - is not a [**Looked After Child**](https://www.datadictionary.nhs.uk/nhs_business_definitions/looked_after_child.html "A Looked After Child (also referred to as a Child Looked After) is a child in the care of a Local Authority.") |
+
+### Educational Assessment Outcome
+
+<https://www.datadictionary.nhs.uk/data_elements/educational_assessment_outcome.html>
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 01 | No [**Special Education Needs**](https://www.datadictionary.nhs.uk/supporting_information/special_education_needs.html "Special Education Needs refers to children who have Learning Difficulties or disabilities that make it harder for them to learn or access EDUCATION than most children of the same age.") |
+| 02 | School Action (Retired 01 September 2015) |
+| 03 | School Action Plus and Statutory Assessment (Retired 01 September 2015) |
+| 04 | Statemented (Retired 01 September 2015) |
+| 05 | Subject to [**Education, Health and Care Plan**](https://www.datadictionary.nhs.uk/nhs_business_definitions/education_health_and_care_plan.html "An Education, Health and Care Plan (EHC) is the document which replaces Statements of Need and Learning Difficulties Assessments for Children or Young People with Special Educational Needs.") ( [**EHC**](https://www.datadictionary.nhs.uk/nhs_business_definitions/education_health_and_care_plan.html "An Education, Health and Care Plan (EHC) is the document which replaces Statements of Need and Learning Difficulties Assessments for Children or Young People with Special Educational Needs.")) |
+
+### Safe guarding factor
+
+| Code | Description |
+|:----------------------------------:|:----------------------------------:|
+| 01 | Repeat [**Emergency Care Attendances**](https://www.datadictionary.nhs.uk/nhs_business_definitions/emergency_care_attendance.html "An Emergency Care Attendance is an individual visit by one PATIENT to an Emergency Care Department to receive treatment.") |
+| 02 | Concerning parent child interaction |
+| 03 | Worrying parent behaviour / Mental Health concerns |
+| 04 | Worrying child behaviour |
+| 05 | Self harm |
+| 06 | Genital injury (excluding Female Genital Mutilation (FGM)) |
+| 07 | Referral from Social Services or Police |
+| 08 | Previously known to Social Services |
+| 09 | Significant injury in child (in the last 12 months) |
+| 10 | Domestic abuse |
+| 11 | History inconsistent with injuries |
+| 12 | Disclosure of abuse |
+| 13 | Bullying |
+| 14 | Delay in presentation (Children with frequent minor injuries and there is a delay in presentation to medical staff) |
+| 15 | Other (Retired 01 September 2015) |
+| 16 | Female Genital Mutilation (FGM) |
+| 98 | Other (not listed) |
+
+```{r}
+
+
+
+csdsmpiQry <- "WITH cte AS (
+    
+SELECT 
+[EDUCATIONALESTABLISHMENTCODE]
+      ,[LANGUAGECODEPREFERRED]
+      ,[LOOKEDAFTERIND]
+      ,[SAFEGUARDINGVULFACTORSIND]
+      ,[EDASSESSOUTCOME]
+      ,[AGEATREPORTINGPERIODSTART_DER]
+      ,[AGEATREPORTINGPERIODEND_DER]
+      ,mpi.[EFFECTIVE_FROM] as MPI_date
+	  ,ROW_NUMBER() OVER (
+               PARTITION BY mpi.[LocalPatientID]
+               ORDER BY mpi.[EFFECTIVE_FROM] DESC
+           ) AS MPIrn
+      ,mpi.[LocalPatientID]
+      ,[PatientId]
+      ,mpi.[UNIQUESERVICEREQID]
+  FROM [database].[CSDS].[001_MPI] mpi
+	where  PatientId is not null and  [AgeGroup_RP_StartDate] like '0-18'
+)
+
+SELECT * 
+FROM cte 
+WHERE MPIrn = 1 
+order by  PatientId;"
+
+csdsMPI <- dbGetQuery(con, csdsmpiQry)
+
+csdsMPI <- csdsMPI %>%
+  mutate(PatientId = as.integer(PatientId)) %>%
+  inner_join(MPISrc %>% filter(latest_flag == 1, der_Age <19) %>% select(PatientId) ) 
+
+
+DBI::dbWriteTable(
+  con,
+  name = "#csdsMPI",
+  value = csdsMPI,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+csdsDataQry <- "
+SELECT 
+       [EDUCATIONALESTABLISHMENTCODE]
+      ,[LANGUAGECODEPREFERRED]
+      ,[LOOKEDAFTERIND]
+      ,[SAFEGUARDINGVULFACTORSIND]
+      ,[EDASSESSOUTCOME]
+      ,[AGEATREPORTINGPERIODSTART_DER]
+      ,[AGEATREPORTINGPERIODEND_DER]
+      ,MPI_date
+	  ,sg.EFFECTIVE_FROM as sg_date
+	  ,sg.SafeguardingFactors_Type
+      ,[PatientId]
+      ,person.[EFFECTIVE_FROM] as person_date
+      ,[SNOMED_ID]
+	  ,[SNOMEDDescription] 
+from #CSDSmpi mpi
+left join(
+SELECT 
+      [EFFECTIVE_FROM]
+      ,[LocalPatientID]
+      ,[SafeguardingFactors_Type]
+	  ,ROW_NUMBER() OVER (
+               PARTITION BY [LocalPatientID]
+               ORDER BY EFFECTIVE_FROM DESC
+           ) AS SGrn
+  FROM [database].[CSDS].[402_Safeguarding_Vulnerability]) sg 
+  on sg.[LocalPatientID] = mpi.[LocalPatientID]
+left join(
+  SELECT 
+      [Person_ID]
+      ,[EFFECTIVE_FROM]
+      ,[LocalPatientID]
+      ,[SNOMED_ID]
+	  ,[SNOMEDDescription]
+      ,[Circumstance_RecordedDate]
+      ,[Circumstance_RecordedDate_AsDate]
+	  ,ROW_NUMBER() OVER (
+               PARTITION BY [LocalPatientID]
+               ORDER BY EFFECTIVE_FROM DESC
+           ) AS Personrn
+  FROM [database].[CSDS].[006_Soc_Per_Circumstances] 
+  left join (SELECT  [SNOMEDCode]
+      ,[SNOMEDDescription]
+  FROM [Reference].[SNOMED].[DIM_tbSNOMEDDescriptions]) sno_desc 
+  on sno_desc.SNOMEDCode = SNOMED_ID
+  where [SNOMED_ID] in ('713071004',
+'37341000000109',
+'284603006',
+'943781000000104',
+'160870005',
+'135891007',
+'326071000000101',
+'287441000000101',
+'135890008',
+'810771000000107',
+'802301000000102',
+'802271000000100',
+'802311000000100',
+'1064311000000109',
+'228141003',
+'424896002',
+'371772001',
+'881081000000100',
+'371775004',
+'160324006',
+'287351000000105',
+'57177007',
+'228273003',
+'429746005',
+'224331001',
+'161129001',
+'169941005',
+'342891000000105',
+'418506006',
+'342191000000101',
+'415658005',
+'818901000000100',
+'879911000000102',
+'445521005'
+)  ) person
+  on person.LocalPatientID  = mpi.[LocalPatientID]
+
+ where  (EDASSESSOUTCOME like '05' or
+       LOOKEDAFTERIND like 'Y' or 
+	   SAFEGUARDINGVULFACTORSIND like 'Y' or
+	   SafeguardingFactors_Type  is not null or
+	 [SNOMEDDescription] is not null)
+    "
+
+
+
+csdsSrc <- dbGetQuery(con, csdsDataQry)
+
+```
+
+# Export data
+
+```{r}
+
+saveRDS(susSrc,'susSrc.rds', compress = TRUE)
+saveRDS(IAPTSrc,'IAPTSrc.rds', compress = TRUE)
+saveRDS(MHSDSSrc,'MHSDSSrc.rds', compress = TRUE)
+saveRDS(MHSDSDataLegalSrc,'MHSDSDataLegalSrc.rds', compress = TRUE)
+saveRDS(MHSDSDataPersonalFull,'MHSDSDataPersonalFullSrc.rds', compress = TRUE)
+saveRDS(susAPCSrc,'susAPCSrc.rds', compress = TRUE)
+saveRDS(susOPCS4Src,'susOPCS4Src.rds', compress = TRUE)
+saveRDS(susOPSrc,'susOPSrc.rds', compress = TRUE)
+saveRDS(AlcoholSrc,'AlcoholSrc.rds', compress = TRUE)
+saveRDS(Nine99Src,'Nine99Src.rds', compress = TRUE)
+saveRDS(EDSrc,'EDSrc.rds', compress = TRUE)
+saveRDS(One11Src,'One11Src.rds', compress = TRUE)
+saveRDS(One11WMASSrc,'One11WMASSrc.rds', compress = TRUE)
+saveRDS(RxSrc,'RxSrc.rds', compress = TRUE)
+saveRDS(MPISrc,'MPISrc.rds', compress = TRUE)
+saveRDS(maternitySrc,'maternitySrc.rds', compress = TRUE)
+saveRDS(DeathSrc,'DeathSrc.rds', compress = TRUE)
+saveRDS(csdsSrc,'csdsSrc.rds', compress = TRUE)
+
+```
