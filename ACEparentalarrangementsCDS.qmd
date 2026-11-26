@@ -1,0 +1,647 @@
+---
+title: "ACE Parental linkage"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: false
+  warning: false
+  error: false
+self-contained: true
+---
+
+# Identifying parents from commissioning data sets
+
+ACE is based on parental exposures, therefore need way to identify if the children are living with parents and who their parents are. Especially to look at parental separation. The only parental link directly recorded in commissioning data sets is between mother and their baby. At birth registration the Mother's and Father's Date of Births are recorded. Could this be sufficient to link to who a child is living with today.
+
+Got this for all under 13 year olds, as we have births from 2013. Off course children will move in and out of the area. The cohort here is children living in the ICB, we will not know the parentage for those born outside and moved in. This restricts our cohort to just those born and currently living in the ICB.
+
+## Do children live with birth parents?
+
+```{r, libraries}
+#| include: false
+
+library(tidyverse) #tidyverse
+library(DBI)        #database connection library
+library(gt)
+library(ggiraph)
+
+```
+
+Starting point is the Birth where the mother and father's DOB is recorded along with the baby's NHS Number.
+
+```{r}
+
+#Functions to suppress small numbers in line with NHS guidance
+
+suppress_countDF <- function(df, count) {
+  
+  df <- df %>%
+    mutate(
+      count_suppressed = if_else(
+        count < 10,
+        10,
+        ceiling(count / 5) * 5
+      )
+    )
+}
+
+suppress_count <- function(count) {
+      count_suppressed = if_else(
+        count < 10,
+        10,
+        ceiling(count / 5) * 5)
+      
+}
+
+
+```
+
+```{r,connect}
+# create connection
+
+
+con <- dbConnect(odbc::odbc(), .connection_string = "Driver={SQL Server};
+server=XXXX;
+                 database=XXXX", timeout = 10)
+```
+
+Starting point is the Birth where the mother and father's DOB is recorded along with the baby's NHS Number.
+
+```{r births}
+
+query <- paste0("
+
+SELECT 
+      [BIRTH_INMARRIAGE]
+      ,[Partial_Baby_DOB]
+      ,[Date_Of_Registration]
+      ,concat(left([Father_DateofBirth],4),right([Father_DateofBirth],2))  as [Father_DateofBirth] 
+      ,concat(left([Mother_DateofBirth],4),right([Mother_DateofBirth],2))  as [Mother_DateofBirth]
+      ,[Baby_NHSNumber]
+  FROM [database].[CivilReg].[Births]
+where death_lab is null")
+		  
+  
+births   <- dbGetQuery(con, query)
+
+birthsDQ <- births %>%
+  filter(is.na(Baby_NHSNumber)| is.na(Mother_DateofBirth)| is.na(Father_DateofBirth)) %>%
+  mutate(missingNHSno = if_else(is.na(Baby_NHSNumber),1,0),
+         missingMDOB = if_else(Mother_DateofBirth== '',1,0),
+         missingFDOB = if_else(Father_DateofBirth== '',1,0)) %>%
+    summarise(missingNHSno = sum(missingNHSno, na.rm = TRUE),
+              missingMDOB = sum(missingMDOB, na.rm = TRUE),
+              missingFDOB = sum(missingFDOB, na.rm = TRUE))
+
+births <- births %>% 
+  mutate(Baby_NHSNumber = as.integer(Baby_NHSNumber,
+         Mother_DateofBirth = if_else(Mother_DateofBirth== '',NA,Mother_DateofBirth),
+         Father_DateofBirth = if_else(Father_DateofBirth== '',NA,Father_DateofBirth)) ) %>%
+  filter(!duplicated(.)) %>%
+  filter(!is.na(Baby_NHSNumber))
+
+
+		  
+
+```
+
+### How many births have there been since when.
+
+```{r}
+
+
+birthsFrom <- births  %>%
+  mutate(yearofreg = substring(births$Date_Of_Registration,1,4)) %>% 
+  summarise(n = n(), .by = yearofreg) %>%
+  arrange(yearofreg)
+
+birthsFrom %>% 
+  ggplot() +
+  geom_col(aes(yearofreg,n))
+
+
+```
+
+## Population linkage
+
+There are two data sets for current residents:
+
+1.  NHS Spine extract for resident population
+
+2.  NHS Spine linked to UPRN
+
+For some reason there are more in the UPRN than the Spine extract, despite NHS number appearing only once in each data sets.
+
+As the Spine extract is regarded as the TRUTH then only those UPRN records with a match to a child in the resident file are going to be used
+
+```{r households}
+
+query <- paste0("SELECT
+[patientid]
+      ,[Birth_Month]
+      ,Gender
+      ,[der_Age] as age
+,encrypt_clear_uprn
+      ,[living_alone_flag]
+      ,[living_with_under_18_flag]
+  FROM [database].[National].[Acorn_UPRN]
+	where  cast([modified_date] as date) = '2026-09-01' and
+              [Death_Month] is null and 
+[der_SICB_Code_Of_Residence] in ('15E','D2P2L')
+               and encrypt_clear_uprn is not null 
+                and patientid is not null")
+
+households   <- dbGetQuery(con, query)
+
+regpop <- "
+      SELECT [Pseudo_NHS_Number]
+      ,[Ethnicity_Code]
+      ,[Ethnicity_Full_Description]
+      ,[Ethnicity_Grouping]
+      ,[IMD_Decile]
+      ,[IMD_Quintile]
+      ,[PrimaryCareProviderEffectiveDate]
+      FROM [database].[BBCS].[Demographic_resident_Population]"
+
+regpop   <- dbGetQuery(con, regpop)
+
+regpop$Pseudo_NHS_Number <- as.integer(regpop$Pseudo_NHS_Number)
+
+households <- households %>% 
+  inner_join(regpop, by = c('patientid' = 'Pseudo_NHS_Number'))
+
+children <- households %>% 
+  filter(age <18)
+
+```
+
+Some babies will be born in ICB but not live there, and some will move out of the ICB, these births need to be excluded.
+
+Join the households in which the babies born in ICB live CURRENTLY based on the birth NHS number and MPI NHS number.
+
+```{r}
+
+BirthsLinkedToHHS <- households %>%
+  inner_join(births, by =c('patientid' = 'Baby_NHSNumber')) %>%
+  rename(Baby_NHSNumber = patientid)
+
+
+```
+
+The births only go back to 2013 so any child aged over 13 will not have a birth record.
+
+Anti join births to all children to exclude those not in born in ICB and any over age 13 for whom we do not know the Mother and Father's DOB.
+
+```{r}
+
+childrenNotBorninBBCS <- children %>%
+  anti_join(BirthsLinkedToHHS, by =c('patientid' = 'Baby_NHSNumber')) %>%
+  filter(age < 13)
+
+```
+
+Find the adults in those households by joining all the NHS numbers in those households aged over 18. This is the target list of parents in households for children born and living in BBCS aged \<13
+
+Looking for the babies household and then testing whether the mother or fathers dob match to any adult in household
+
+```{r}
+
+#target list
+ParentsbyHHs<- BirthsLinkedToHHS %>% 
+               select(encrypt_clear_uprn,Baby_NHSNumber, Father_DateofBirth, Mother_DateofBirth) %>%
+  summarise(.by = c(encrypt_clear_uprn, Baby_NHSNumber, Father_DateofBirth, Mother_DateofBirth)) %>%
+  mutate(Mother_DateofBirth = as.integer(Mother_DateofBirth),
+         Father_DateofBirth = as.integer(Father_DateofBirth)) 
+
+MothersOfBabiesLinkedToHHS <- households %>%
+  #adults
+  filter(age > 18, Gender == 2) %>%
+  #join to the babies household
+  inner_join(ParentsbyHHs, by = c('encrypt_clear_uprn')) %>%
+  #it is their birth mother if 
+  mutate(BirthParent = if_else(Mother_DateofBirth == Birth_Month,'Mother',NA)) %>%
+  filter(!is.na(BirthParent))
+
+FathersOfBabiesLinkedToHHS <- households %>%
+  #adults
+  filter(age > 18, Gender == 1) %>%
+  #join to the babies household
+  inner_join(ParentsbyHHs, by = c('encrypt_clear_uprn')) %>%
+  #it is their birth Father  if 
+  mutate(BirthParent = if_else(Father_DateofBirth == Birth_Month,'Father',NA)) %>%
+  filter(!is.na(BirthParent))
+                         
+
+
+```
+
+### How many children are living with their mother aged under 13 born and living in BBCS?
+
+```{r}
+
+babies_per_mother <- MothersOfBabiesLinkedToHHS %>%
+  filter(!is.na(Mother_DateofBirth)) %>%
+  summarise(
+    n_babies = n_distinct(Baby_NHSNumber),
+    .by = patientid
+  )
+
+ggplot(babies_per_mother, aes(x = n_babies)) +
+  geom_histogram(binwidth = 1, boundary = 0.5, fill = "steelblue") +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(
+    x = "Number of babies per mother",
+    y = "Number of mothers"
+  ) +
+  theme_minimal()
+
+gt(babies_per_mother  %>%
+     summarise(
+       Babies_per_mother = n(),
+       .by = n_babies
+     ) %>%
+     mutate(Babies_per_mother = suppress_count(Babies_per_mother) ) %>%
+     arrange(n_babies)
+     )
+
+```
+
+### How many children are living with their father aged under 13 born and living in BBCS?
+
+```{r}
+
+babies_per_father <- FathersOfBabiesLinkedToHHS %>%
+  filter(!is.na(Father_DateofBirth)) %>%
+  summarise(
+    n_babies = n_distinct(Baby_NHSNumber),
+    .by = patientid
+  )
+
+ggplot(babies_per_father, aes(x = n_babies)) +
+  geom_histogram(binwidth = 1, boundary = 0.5, fill = "steelblue") +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(
+    x = "Number of babies per father",
+    y = "Number of fathers"
+  ) +
+  theme_minimal()
+
+gt(babies_per_father  %>%
+     summarise(
+       Babies_per_father = n(),
+       .by = n_babies
+     ) %>%
+     mutate(Babies_per_father = suppress_count(Babies_per_father) ) %>%
+     arrange(n_babies)
+)
+```
+
+### How many children born and living in BBCS aged \<13 are not living with their birth mother
+
+```{r}
+
+ChildrenNotlinkedtoMotherinHHS <- BirthsLinkedToHHS %>% 
+  #only children born from  2013 will be linkable
+  anti_join(MothersOfBabiesLinkedToHHS, by = c('Baby_NHSNumber' = 'Baby_NHSNumber')) %>%
+  mutate(Mother = 'Not with Mother')
+
+
+```
+
+### How many children born and living in BBCS aged \<13 are not living with their birth father
+
+```{r}
+
+ChildrenNotlinkedtoFatherinHHS <- BirthsLinkedToHHS %>% 
+  #only children born from  2013 will be linkable
+  anti_join(FathersOfBabiesLinkedToHHS, by = c('Baby_NHSNumber' = 'Baby_NHSNumber')) %>%
+  mutate(Father  = 'Not with father')
+
+
+```
+
+## Check back vs MSDS for mother's NHS Number
+
+```{r}
+
+query <- paste0(
+  
+"WITH motherMSDS AS (
+    SELECT
+        Person_ID_Mother,
+        MotherPatientId,
+        CASE
+            WHEN (LEN(PostcodeDistrictMother) = 2 AND PostcodeDistrictMother LIKE 'B[0123456789]')
+              OR (LEN(PostcodeDistrictMother) = 3 AND PostcodeDistrictMother LIKE 'B[123]%')
+              OR (LEN(PostcodeDistrictMother) = 3 AND PostcodeDistrictMother LIKE 'B4[012345678]')
+              OR (LEN(PostcodeDistrictMother) = 3 AND PostcodeDistrictMother LIKE 'B7[23456]')
+              OR (LEN(PostcodeDistrictMother) = 3 AND PostcodeDistrictMother LIKE 'B9[01234]')
+            THEN 'BSol'
+            ELSE 'Not Bsol'
+        END AS PostcodeDistrict
+    FROM (
+        SELECT
+            Person_ID_Mother,
+            MotherPatientId,
+            PostcodeDistrictMother,
+            ROW_NUMBER() OVER (
+                PARTITION BY Person_ID_Mother
+                ORDER BY LoadDate DESC
+            ) AS rn
+        FROM EAT_Reporting_BSOL.Maternity_MSDS.MSD001MotherDemog
+        WHERE MotherPatientId IS NOT NULL
+          AND Person_ID_Mother NOT IN ('IT28A1QQDOT78VQ', 'QMXUDV2C1RFSD9Q')
+    ) t
+    WHERE rn = 1
+),
+babiesMSDS AS (
+    SELECT
+        AgeAtBirthMother,
+        LabourDeliveryID,
+        Person_ID_Baby,
+        Person_ID_Mother,
+        PersonBirthTimeBaby,
+        PersonPhenSex,
+        PregOutcome,
+        PersonBirthDateBaby,
+        BabyPatientId
+    FROM (
+        SELECT
+            AgeAtBirthMother,
+            LabourDeliveryID,
+            Person_ID_Baby,
+            Person_ID_Mother,
+            PersonBirthTimeBaby,
+            PersonPhenSex,
+            PregOutcome,
+            PersonBirthDateBaby,
+            BabyPatientId,
+            ROW_NUMBER() OVER (
+                PARTITION BY BabyPatientId
+                ORDER BY LoadDate DESC
+            ) AS rn
+        FROM EAT_Reporting_BSOL.Maternity_MSDS.MSD401BabyDemographics_test
+        WHERE YearOfDeathBaby IS NULL
+          AND BabyPatientId IS NOT NULL
+    ) t
+    WHERE rn = 1
+)
+SELECT
+    b.AgeAtBirthMother,
+    b.LabourDeliveryID,
+    b.Person_ID_Baby,
+    b.Person_ID_Mother,
+    m.MotherPatientId,
+    b.PersonBirthTimeBaby,
+    b.PersonPhenSex,
+    b.PregOutcome,
+    b.PersonBirthDateBaby,
+    b.BabyPatientId,
+    m.PostcodeDistrict
+FROM babiesMSDS b
+LEFT JOIN motherMSDS m
+    ON b.Person_ID_Mother = m.Person_ID_Mother;")
+
+MSDS   <- dbGetQuery(con, query)
+
+MSDS   <- MSDS %>% mutate(BabyPatientId = as.integer(BabyPatientId))
+
+```
+
+### Does birth HHS + Mothers NHS match MSDS NHS numbers
+
+```{r}
+
+DQ <- MothersOfBabiesLinkedToHHS %>% 
+  left_join(MSDS, by = c('Baby_NHSNumber' = 'BabyPatientId')) %>% 
+  filter(!is.na(Person_ID_Baby))
+
+#found maternity record for birth
+
+match <- DQ %>% 
+  mutate(reliablity = if_else(MotherPatientId == patientid,1,0)) %>%
+           summarise(matches = sum(reliablity, na.rm = TRUE),
+                    deliveries = n(),
+                    mismatch = deliveries-matches,
+                    Matchpct= round(matches/deliveries*100,1),
+                    MisMatchpct= round(100-Matchpct,1)) %>%
+      mutate(matches = suppress_count(matches),
+             deliveries = suppress_count(deliveries) ,
+             mismatch  = suppress_count(mismatch))
+  
+  gt(match)
+  
+  
+  mismatches <- DQ %>% filter(!MotherPatientId == patientid)
+
+  # remove the mismatches from MothersOfBabiesLinkedToHHS
+  MothersOfBabiesLinkedToHHS <- MothersOfBabiesLinkedToHHS %>% 
+  anti_join(mismatches %>% select(Baby_NHSNumber,patientid))
+
+```
+
+## Summary
+
+```{r}
+
+summary_children <- nrow(BirthsLinkedToHHS)
+summary_livingwithmother <- nrow(MothersOfBabiesLinkedToHHS)
+pct_livingwithmother <- nrow(MothersOfBabiesLinkedToHHS)/nrow(BirthsLinkedToHHS)
+summary_livingwithfather <- nrow(FathersOfBabiesLinkedToHHS)
+pct_livingwithfather <- nrow(FathersOfBabiesLinkedToHHS)/nrow(BirthsLinkedToHHS)
+
+```
+
+There are:
+
+`r summary_children` children under age 13 born in BBCS, still living in BBCS
+
+`r summary_livingwithmother` (`r round(pct_livingwithmother *100,1)` %) are living with their birth mother
+
+`r summary_livingwithfather` (`r round(pct_livingwithfather*100,1)` %) are living with their birth Father
+
+## Parents list for ACE cohort
+
+There are duplicates records caused by loose joins which should be removed.
+
+```{r}
+
+
+ChildrenAndParents <- MothersOfBabiesLinkedToHHS %>%
+  full_join(FathersOfBabiesLinkedToHHS) %>%
+  select(encrypt_clear_uprn, age, Baby_NHSNumber, patientid, Father_DateofBirth, Mother_DateofBirth, BirthParent) 
+
+ChildrenAndParentsduplicates <- MothersOfBabiesLinkedToHHS %>%
+  full_join(FathersOfBabiesLinkedToHHS) %>%
+  select(encrypt_clear_uprn, age, Baby_NHSNumber, patientid, Father_DateofBirth, Mother_DateofBirth, BirthParent) %>%
+  dplyr::summarise(n = dplyr::n(), .by = c(encrypt_clear_uprn,
+  Baby_NHSNumber, BirthParent)) |>
+  dplyr::filter(n > 1L)
+
+
+ChildrenAndParents <- ChildrenAndParents %>%
+  anti_join(ChildrenAndParentsduplicates) %>%
+  select(Baby_NHSNumber, patientid,BirthParent, encrypt_clear_uprn) %>%
+  pivot_wider(names_from = BirthParent, 
+              values_from = c(patientid)) 
+
+#saveRDS(ChildrenAndParents,'ChildrenAndParents.RDS')
+
+
+
+```
+
+### Who are not living with Birth parent
+
+```{r}
+
+NotlivingwithaParent <- ChildrenNotlinkedtoMotherinHHS %>%
+  full_join(ChildrenNotlinkedtoFatherinHHS) %>%
+  mutate(Parents = case_when(
+    !is.na(Mother) & !is.na(Father) ~ 'Neither',
+    !is.na(Father) ~ 'Not WIth Father',
+    !is.na(Mother) ~ 'Not WIth Mother',
+    .default = NA))
+
+saveRDS(NotlivingwithaParent,'NotlivingwithaParent.RDS')
+
+
+Summary_NotlivingwithaParent <- NotlivingwithaParent  %>%
+  summarise(n = n(), .by = Parents) %>%
+  mutate(pct = round(n/summary_children*100,1))
+
+    
+gt(Summary_NotlivingwithaParent)
+
+```
+
+There are few statistics to compare the data to. The closet can get is from the Census, which shows that 24% of children were in single parent households in Birmingham, but we do not know how many of the married and cohabiting couples are birth parents.
+
+Link to Census data.
+
+<https://www.ons.gov.uk/datasets/create/filter-outputs/2cb5fae5-ed37-4e57-b784-fbcf136240e5#get-data>
+
+![](images/clipboard-2212987314.png)
+
+```{r}
+
+neitherParentList <- NotlivingwithaParent %>%
+  filter(Parents == 'Neither') %>%
+  select(Baby_NHSNumber)
+
+readr::write_csv(neitherParentList, "output3.csv", quote = "all")
+
+
+DBI::dbWriteTable(
+  con,
+  name = "#neitherParentList",
+  value = neitherParentList,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+query <- paste0("
+       SELECT 
+       [patientid]
+     ,[CareHomeFlag]
+      ,[CareHome_Is_Active]
+    --  ,[total_household_population]
+      ,[OS_ClassificationDescription]
+      ,[OS_BuildStatus]
+      ,[CACI_Household_Acorn_Type_Description]
+      ,[EPC_Property]
+      ,[EPC_BuiltForm]
+      ,[EPC_Tenure]
+  FROM [Cluster_BBCS].[National].[Acorn_UPRN] a
+ inner join #neitherParentList np on np.Baby_NHSNumber = a.patientid
+	where  cast([modified_date] as date) = '2026-09-01' and
+              [Death_Month] is null and 
+[der_SICB_Code_Of_Residence] in ('15E','D2P2L')
+               and encrypt_clear_uprn is not null 
+                and patientid is not null"
+)
+
+neitherParentHHS   <- dbGetQuery(con, query)
+
+
+neitherParentHHS <- neitherParentHHS %>%
+  left_join(children)
+
+```
+
+## Where do the children not identified as living with birth parent live?
+
+```{r}
+
+
+neitherParentHHS %>% 
+  summarise(Children = n(), .by= OS_ClassificationDescription) %>%
+  filter(Children > 5) %>%
+  ggplot() +
+  geom_col(aes(y = OS_ClassificationDescription, x = Children))
+  
+
+```
+
+### Age and gender
+
+```{r}
+
+neitherParentHHS %>%
+  summarise(
+    Children = n(),
+    .by = c(age, Gender)
+  ) %>%
+  mutate(Gender = as.factor(Gender)) %>%
+  ggplot(aes(x = age, y = Children, fill = Gender)) +
+  geom_col(position = "dodge") +
+  labs(
+    x = "Age",
+    y = "Number of Children",
+    fill = "Gender"
+  ) +
+  theme_minimal()
+  
+
+```
+
+### Ethnicity_Full_Description
+
+```{r}
+
+
+neitherParentHHS %>% 
+  summarise(Children = n(), .by= Ethnicity_Full_Description) %>%
+  filter(Children > 5) %>%
+  ggplot() +
+  geom_col(aes(y = Ethnicity_Full_Description, x = Children)) +
+  labs(
+    x = "Number of Children",
+    fill = "Gender"
+  ) +
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+  
+
+```
+
+### PrimaryCareProviderEffectiveDate
+
+Have they moved recently?
+
+```{r}
+
+
+neitherParentHHS %>% 
+  mutate(PrimaryCareProviderEffectiveDate =
+      floor_date(as.Date(PrimaryCareProviderEffectiveDate), "month")) %>%
+  summarise(Children = n(), .by= PrimaryCareProviderEffectiveDate) %>%
+  filter(Children > 5) %>%
+  ggplot() +
+  geom_col(aes(x = PrimaryCareProviderEffectiveDate, y = Children))
+  
+
+```
