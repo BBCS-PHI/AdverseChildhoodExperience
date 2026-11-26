@@ -1,0 +1,711 @@
+---
+title: "ACE"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+execute:
+  echo: false
+  warning: false
+  error: false
+self-contained: true
+---
+
+# Adverse Childhood Experience
+
+This quarto brings in the people who have matched the ACE in EHR criteria and the extension to other Commissioning data sets.
+
+It builds an exposure table, brings in the parental linkages and then identifies children in those households who could have experienced an adverse event.
+
+# Exposure table
+
+Building table of exposure of those having a ACE and living in BSOL. Using residency.
+
+```{r, libraries}
+#| include: false
+
+library(tidyverse) #tidyverse
+library(DBI)        #database connection library
+library(gtable)
+library(ggiraph)
+library(ggVennDiagram)
+library(scales)
+
+```
+
+```{r readRDS}
+#| include: true
+#| echo: true
+# Load exposures
+
+susData <- readRDS('susSrc.rds')
+IAPTData <- readRDS('IAPTSrc.rds')
+MHSDSData <- readRDS('MHSDSSrc.rds')
+MHSDSPersonalFullData <- readRDS('MHSDSDataPersonalFullSrc.rds')
+susAPCData <- readRDS('susAPCSrc.rds')
+susOPCS4Data <- readRDS('susOPCS4Src.rds')
+susOPData <- readRDS('susOPSrc.rds')
+AlcoholData <- readRDS('AlcoholSrc.rds')
+Nine99Data <- readRDS('Nine99Src.rds')
+EDData <- readRDS('EDSrc.rds')
+One11Data <- readRDS('One11Src.rds')
+One11WMASData <- readRDS('One11WMASSrc.rds')
+RxData <- readRDS('RxSrc.rds')
+MPIData <- readRDS('MPISrc.rds')
+DeathsData <- readRDS('DeathSrc.rds')
+csdsData <- readRDS('csdsSrc.rds')
+
+
+df <- read.csv('icd102019syst_groups.csv')
+
+ICDgroups <- df %>%
+  rename(From = 1)
+```
+
+```{r}
+#Functions to suppress small numbers in line with NHS guidance
+
+suppress_countDF <- function(df, count) {
+  
+  df <- df %>%
+    mutate(
+      count_suppressed = if_else(
+        count < 10,
+        10,
+        ceiling(count / 5) * 5
+      )
+    )
+}
+
+suppress_count <- function(count) {
+  count_suppressed = if_else(
+    count < 10,
+    10,
+    ceiling(count / 5) * 5)
+  
+}
+```
+
+```{r MPIData}
+#| include: true
+#| echo: true
+# Get population table
+
+MPIDataLatest <- MPIData %>% 
+  slice_max(modified_date) %>%
+  filter(is.na(Death_Month),der_SICB_Code_Of_Residence == '15E' ) %>%
+  select(PatientId, UPRN, Gender, Death_Month, der_Age, 
+         der_SICB_Code_Of_Residence, der_SICB_Code_Of_Registration, 
+         LSOA_2021, total_household_population, living_with_under_18_flag,
+         OS_ClassificationCode, OS_ClassificationDescription,OS_BuildStatus,
+         OS_Private_Outdoor_Space_Flag,
+         CACI_Household_Acorn_Type, CACI_Household_Acorn_Type_Description,
+         EPC_Property, EPC_BuiltForm, EPC_Tenure, 
+         modified_date
+  )
+
+  households <- MPIDataLatest %>%
+  arrange(UPRN) %>%              # ensure ordering
+  group_by(UPRN) %>%             # regroup after join
+  mutate(row_id = row_number()) %>% # row number per UPRN
+  filter(row_id == 1) %>%
+    ungroup() 
+  
+  rm(MPIData)
+
+
+```
+
+## Parental relationships
+
+Bring in Children and Parents table from the ACEparentalarrangements scipt
+
+There will be other children in the households who were not necessarily born in BSol, or from other arrangements, eg step children etc
+
+```{r parental relationships}
+
+#all children
+ChildrenAndParentsSrc <- readRDS('ChildrenAndParents.RDS') 
+
+ChildrenAndParentsSrc <-  ChildrenAndParentsSrc %>% 
+  rename(UPRN = encrypt_clear_uprn,
+         PatientId = Baby_NHSNumber) 
+
+
+ChildrenLivingInSingleAdultHHS <- ChildrenAndParentsSrc %>% 
+  filter(is.na(Mother) | is.na(Father))   %>%  
+  mutate(
+        event = case_when( 
+          is.na(Mother) ~ 'Parental Seperation - Mother',
+          is.na(Father) ~ 'Parental Seperation - Father',
+          .default = NA),
+        coding_term = event,
+        ACE_indicator_code = 'PS1',
+        indicator_specific  = event,
+        indicator_1 = event,
+        indicator_2 = event,
+        domain = 'PS',
+        severity = 'Parental Seperation',
+        system = 'ONS registration',
+        cut_off = NA) 
+
+NotlivingwithaParent <-  readRDS('NotlivingwithaParent.RDS')
+
+ChildrenNotlivingwithAParent <- NotlivingwithaParent %>%
+  filter(Parents == 'Neither') %>%  
+  mutate(
+    event = 'Parental Seperation - Both',
+    coding_term = event,
+    ACE_indicator_code = 'PS2',
+    indicator_specific  = event,
+    indicator_1 = event,
+    indicator_2 = event,
+    domain = 'PS',
+    severity = 'Parental Seperation',
+    system = 'ONS registration',
+    cut_off = NA,
+    MOther = NA,
+    Father = NA) %>%
+  rename(UPRN = encrypt_clear_uprn,
+         PatientId = Baby_NHSNumber) %>%
+  select( PatientId,
+          event,
+          coding_term ,
+          ACE_indicator_code,
+          indicator_specific,
+          indicator_1 ,
+          indicator_2 ,
+          domain ,
+          severity ,
+          system ,
+          cut_off ,
+          MOther ,
+          Father )
+
+
+
+ChildrenAndParentSeperation <- bind_rows(ChildrenLivingInSingleAdultHHS,
+                                ChildrenNotlivingwithAParent) 
+
+childrenLivingWithBirthParents  <- ChildrenAndParentsSrc %>%
+  filter(!is.na(Mother) & !is.na(Father))
+
+#from MPI children not in parental linkage table
+other_household_children  <- MPIDataLatest %>% 
+  filter(der_Age <=18) %>%
+  anti_join(ChildrenAndParentsSrc  %>% select(PatientId)) 
+
+All_children <- bind_rows(ChildrenAndParentsSrc %>% select(UPRN,PatientId),
+                          other_household_children %>% select(UPRN,PatientId)) %>%
+  distinct() %>% 
+  left_join(MPIDataLatest) %>%
+  filter(!is.na(der_Age))
+
+
+
+```
+
+```{r ACE}
+#| include: TRUE
+#| echo:  true
+
+allACEcriteria <- susData %>%
+  filter(!is.na(PatientId)) %>%
+  select(
+        event,
+        PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) %>%
+  union(susAPCData   %>% 
+          select(
+            event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId)))%>%
+  union(susOPCS4Data 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId))) %>%
+  union(susOPData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId)))  %>%
+  union(MHSDSData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId))) %>%
+  union(MHSDSPersonalFullData 
+        %>% select(
+          event,
+          PatientId,
+          coding_term,
+          ACE_indicator_code,
+          indicator_specific,
+          indicator_1,
+          indicator_2,
+          domain,
+          severity,
+          system,
+          cut_off) 
+        %>% filter(!is.na(PatientId))) %>%
+  union(One11Data 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId))) %>%
+  union(One11WMASData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId))) %>%
+   union(IAPTData
+             %>% select(
+               event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+             %>% filter(!is.na(PatientId))) %>%
+  union(AlcoholData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId))) %>%
+  union(Nine99Data 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId)))  %>%
+  union(EDData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId)))   %>%
+  union(RxData 
+            %>% select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId) ))  %>%
+  union(ChildrenAndParentSeperation    %>% 
+          select(
+              event,
+         PatientId,
+        coding_term,
+        ACE_indicator_code,
+        indicator_specific,
+        indicator_1,
+        indicator_2,
+        domain,
+        severity,
+        system,
+        cut_off) 
+            %>% filter(!is.na(PatientId) ))
+
+#rm(susAPCData, susData, susOPCS4Data, susOPData, RxData, Nine99Data, One11Data, One11WMASData, AlcoholData, EDData, MHSDSData,MHSDSDataEduc, MHSDSDataLAC, MHSDSDataLDA,MHSDSDataLegal,  IAPTData, DeathsData)
+
+```
+
+
+```{r}
+#| include: true
+#| echo: true
+
+
+Under18BSolCount <- nrow(All_children)  
+
+MPIOver18BSol <- MPIDataLatest %>% 
+  filter(der_Age >= 19)
+
+Over18BSolCount <-  nrow(MPIOver18BSol)  
+
+
+```
+
+## The 10 question areas
+
+- Emotional abuse
+
+- Physical abuse
+
+- Sexual abuse
+
+- Emotional neglect
+
+- Physical neglect
+
+- Witnessing intimate partner violence
+
+- Household substance abuse
+
+- Household mental illness
+
+- Parental divorce or separation
+
+- Household incarceration - no data on whether anyone in household had been incarcerated
+
+## Domains
+
+Using the ACEinEHR code list, and local algorithm we get 6 domains
+
+**Adverse family environments (AFE)**
+
+This domain includes indicators of adverse family environments (AFE), aligning with the original ACE domain "household challenges". We define an AFE as any clinically intervenable psychosocial risk factor or experience recorded in the child or the parent
+
+**Child maltreatment (CM)**
+
+This domain includes indicators of child maltreatment (CM). CM refers to any act of commission or omission by a parent or other caregiver that results in harm, potential for harm, or threat of harm to a child. This domain includes the *High-risk presentations of child maltreatment (HRP-CM)* that includes indicators of high-risk presentations of child maltreatment (HRP-CM), consistent with NICE Clinical guidelines (CG89 and NG76) on alerting features that should raise clinical suspicions for CM.
+
+**Intimate partner violence (IPV)**
+
+This domain includes indicators of intimate partner violence (IPV). The WHO defines IPV as any behaviour within an intimate relationship that causes physical, psychological or sexual harm to those in the relationship. IPV indicators are restricted to parents aged ≥16.
+
+**Parental mental health problems (MHP)**
+
+This domain includes indicators of mental health problems (MHP) recorded in the parent concurrent with classifications laid out within the current ICD-10, excluding indicators of substance misuse.
+
+**Parental Substance misuse (SM)**
+
+This domain includes indicators of substance misuse (SM) recorded in the parent concurrent with classifications laid out within the current ICD-10.
+
+**Parental Seperation (PS)**
+
+Using the birth registration file able to track birth parents where recorded and children still live in BSol.
+
+
+
+```{r}
+#| include: true
+#| echo: true
+# set up exposure table from long to wide
+
+exposureTable <- allACEcriteria %>%
+  mutate(count = 1,
+         domain = if_else(domain == 'IPV_ASSLT_ALGO', 'IPV',domain )) %>%
+  select(-c('indicator_specific', 'indicator_1', 'indicator_2', 'ACE_indicator_code', 'coding_term', 'severity', 'cut_off', 'system')) %>%
+  summarise(domainCount = n(), .by = c(PatientId,  domain)) %>%
+  pivot_wider(names_from = domain,
+    values_from = c('domain','domainCount'),
+   # take first occurrence
+    values_fill = NA) %>% 
+  mutate(domainSentance = str_replace_all(paste(domain_AFE,`domain_HRP-CM`, domain_MHP,domain_SM, domain_IPV,domain_CM, domain_PS),'NA',''),
+         domainSentance = str_trim(domainSentance), 
+domainSentance = str_replace_all(domainSentance,' ','_'),
+domainSentance = str_replace_all(domainSentance, "_____",
+                                  ":"),
+domainSentance = str_replace_all(domainSentance, "____",
+                                  ":"),
+domainSentance = str_replace_all(domainSentance, "___",
+                                  ":"),
+domainSentance = str_replace_all(domainSentance, "__",
+                                  ":"),
+domainSentance = str_replace_all(domainSentance, "_",
+                                  ":")
+)
+
+```
+
+```{r}
+#| include: true
+#| echo: true
+
+ACEMotherBsol <- ChildrenAndParentsSrc %>% 
+  select(Mother) %>%
+  filter(!is.na(Mother)) %>%
+              left_join(exposureTable,
+                         by = c('Mother' = 'PatientId')) %>%
+  rename(Parent = Mother)
+
+ACEFatherBsol <- ChildrenAndParentsSrc %>% 
+  select(Father) %>%
+  filter(!is.na(Father)) %>%
+              left_join(exposureTable,
+                         by = c('Father' = 'PatientId')) %>%
+  rename(Parent = Father)
+
+
+## remove duplicates as  there will be lines where  they are both parents
+ACEParentalBsol <- bind_rows(ACEMotherBsol,ACEFatherBsol) %>%
+  distinct() %>%
+  left_join(MPIDataLatest, by = c('Parent' = 'PatientId'))
+  
+
+
+ACEParentalBsolSummary <- ACEParentalBsol %>% 
+  summarise(across(everything(), ~ sum(!is.na(.)))) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to = "Domain",
+    values_to = "People") %>%
+  mutate(People = suppress_count(People)) 
+
+```
+
+
+# People with a ACE flag condition
+
+There are `r nrow(All_children)` children aged under 18 in BSol.
+
+There are `r nrow(ACEParentalBsol)` parents over 18 with a condition meeting the criteria, out of a population of `r nrow(MPIOver18BSol)`(`r round(nrow(ACEParentalBsol)/nrow(MPIOver18BSol)*100,1)` %).
+
+## By domain
+
+### How many parents meet one of the domain criteria?
+
+```{r}
+
+ACEParentalBsolSummary %>%filter(str_detect(Domain,'domain_' ))  %>%
+         select(Domain, People)
+
+
+
+```
+
+## Children living in Houses hold with an exposure
+
+There are `r nrow(All_children)` children aged under 18. 
+
+```{r}
+
+ChildrenLivingInExposureHHS <- ChildrenAndParentsSrc %>% 
+  filter(!is.na(UPRN)) %>% 
+  inner_join(ACEParentalBsol, by = 'UPRN') %>% 
+  select(-domain_PS) %>%
+  left_join(ChildrenAndParentSeperation %>%
+              select(PatientId, domain) %>% 
+              rename(domain_PS = domain)) %>%
+  distinct() 
+
+```
+
+These are the children within each domain. Children can be in more than one domain.
+
+```{r}
+
+plot_df <- ChildrenLivingInExposureHHS %>%
+  select(-contains("domainC")) %>%
+  pivot_longer(
+    cols = contains('domain_'),
+    names_to = "domain",
+    values_to = "count"
+  ) %>%
+  mutate(domain = str_replace_all(domain, "domain_", "")) %>%
+  filter(count > 0) %>%
+  distinct(domain, PatientId) %>%
+  summarise(n= n(), .by = domain) %>%
+  mutate(n=  suppress_count(n)) %>%
+ggplot() +
+  geom_col_interactive(
+    aes(
+      x = n,
+      y = domain,
+      fill = domain,
+      tooltip = paste0(domain, "\nCount: ", n)
+    )
+  ) +
+  geom_text(
+    aes(
+      x = n,
+      y = domain,
+      fill = domain,
+      label = paste0(n)
+    )
+  ) +
+  theme_classic() +
+  theme(
+    legend.position =  "none",
+    legend.title = element_blank(),
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.text.y = element_text(size = 7)
+  )
+
+girafe(ggobj = plot_df)
+
+
+
+```
+
+### Density of ACE by children
+
+The figure below shows the count of children by number of domains flagging per child, so child has 0, 1, 2, , etc different domain experiences.
+
+```{r}
+
+
+plot_df <- ChildrenLivingInExposureHHS %>%
+  rename_with(~ sub("^domain_", "", .x))  %>%
+  mutate(
+    density = rowSums(
+      across(c(`HRP-CM`, MHP, SM, IPV, CM, AFE, PS), ~ .x > 0),
+      na.rm = TRUE
+    )
+  ) %>%
+  summarise(n = n(), .by = density) %>%
+ggplot() +
+  geom_col_interactive(
+    aes(
+      x = density,
+      y = n,
+      tooltip = paste0( n,' Children')
+    ), fill = 'lightblue'
+  ) + 
+  scale_y_continuous(labels = label_comma()) +
+  theme_classic() +
+  theme(
+    legend.position =  "none",
+    legend.title = element_blank(),
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_blank(),
+    axis.text.y = element_text(size = 7)
+  )
+
+girafe(ggobj = plot_df)
+  
+
+```
+
+This venn diagram shows the numbers of children with composition of their mulitple exposures.
+
+```{r}
+
+multiVenn <- ChildrenLivingInExposureHHS  %>%
+  rename_with(~ sub("^domain_", "", .x))  %>%
+  select(PatientId, `HRP-CM`, MHP, SM, IPV, CM, AFE, PS) %>%
+  pivot_longer(cols = c(`HRP-CM`, MHP, SM, IPV, CM, AFE, PS),
+               names_to = 'domain_summary') %>%
+  filter(value > 0) %>%
+  distinct(domain_summary, PatientId) %>%
+   group_by(domain_summary) %>%
+   summarise(
+     PatientId = list(PatientId),
+     .groups = "drop"
+   ) %>%
+   tibble::deframe()
+
+names(multiVenn) <- str_wrap(names(multiVenn), width = 15)
+
+ 
+ ggVennDiagram(multiVenn,                
+               set_color = c("lightblue","grey","purple","orange","green",'blue', 'red'),
+               label_alpha = 0,
+               label = "count",
+               label_size = 3,
+  label_color = "grey",
+  set_size = 3) +  
+   scale_fill_distiller(palette = "Blues",
+                        direction = 1)+
+  coord_cartesian(clip = "off") +
+   theme(    legend.position  = "none"
+   )
+
+ 
+
+```
